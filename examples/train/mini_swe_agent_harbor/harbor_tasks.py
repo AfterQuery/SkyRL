@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
@@ -44,6 +45,11 @@ class HarborEvaluationResult(TypedDict):
 
     Harbor's ``reward.txt`` may be fractional; the SWE-Bench version types this as a bool
     and the generator does ``int(resolved)``, which would silently binarise graded tasks.
+
+    ``grading_failed`` separates "the verifier ran and the agent failed" (reward 0, a real
+    training signal) from "the verifier never produced a verdict" (reward 0 only because
+    grading broke). Training on the latter teaches the policy that a possibly-correct
+    solution was wrong, so the caller drops those trajectories instead.
     """
 
     instance_id: str
@@ -51,6 +57,7 @@ class HarborEvaluationResult(TypedDict):
     resolved: bool
     reward_source: str
     eval_error: Optional[str]
+    grading_failed: bool
 
 
 @dataclass(frozen=True)
@@ -130,6 +137,57 @@ def image_tag(task: HarborTask, prefix: str = DEFAULT_IMAGE_PREFIX) -> str:
     return f"{prefix}/{safe}:{digest}"
 
 
+# A stage boundary is `FROM <image>` optionally followed by `AS <name>`, at column 0.
+# The trailing anchor matters: these Dockerfiles embed Python in heredocs, and a lax
+# case-insensitive `^\s*FROM\s` also matches `from pathlib import Path`, which would
+# truncate the "final stage" to the tail of a heredoc and lose the real WORKDIR.
+_FROM_RE = re.compile(r"(?mi)^FROM\s+\S+(?:\s+AS\s+\S+)?\s*$")
+_WORKDIR_RE = re.compile(r'(?mi)^\s*WORKDIR\s+"?([^"\s]+)"?\s*$')
+
+
+def task_workdir(task: HarborTask) -> str | None:
+    """The image's effective ``WORKDIR``, or None if its Dockerfile sets none.
+
+    Needed because mini-swe-agent's DockerEnvironment always passes ``-w <config.cwd>`` to
+    both ``run`` and ``exec``; the image's own WORKDIR is never consulted. A single cwd in
+    the yaml is therefore wrong for any task that does not use it -- and podman (unlike
+    docker) *refuses to start* a container whose workdir is absent::
+
+        Error: workdir "/workspace" does not exist on container
+
+    so a mismatch is a hard failure at container start, not a wrong-directory nuisance.
+
+    Only the final build stage is considered: a multi-stage Dockerfile's earlier WORKDIRs
+    do not carry into the produced image.
+    """
+    dockerfile = task.dockerfile_dir / "Dockerfile"
+    if not dockerfile.exists():
+        return None
+    text = dockerfile.read_text()
+    froms = list(_FROM_RE.finditer(text))
+    final_stage = text[froms[-1].start() :] if froms else text
+    matches = _WORKDIR_RE.findall(final_stage)
+    return matches[-1] if matches else None
+
+
+def declared_image(task: HarborTask) -> str | None:
+    """Prebuilt image from ``task.toml``'s ``[environment].docker_image``, or None.
+
+    Prefer this over building. A Harbor ``environment/Dockerfile`` is typically
+    ``FROM <private repo image>`` plus a layer that applies the task's bug patch, and
+    ``docker_image`` is that same Dockerfile already built and pushed. Using it:
+
+    * removes N local builds from preprocessing (a pull, or nothing, instead),
+    * drops the requirement to authenticate against the *base* repository, and
+    * guarantees every worker runs the identical image the task was authored against,
+      rather than whatever a local rebuild happened to resolve.
+
+    Falling back to a local build stays useful for task trees that predate the field.
+    """
+    value = task._section_value("environment", "docker_image", None)
+    return str(value) if value else None
+
+
 def build_task_image(
     task: HarborTask,
     *,
@@ -191,8 +249,16 @@ def evaluate_harbor_task(
     broken task does not take down the whole training step.
     """
     instance_id = instance.get("instance_id", "unknown")
+    # grading_failed starts True and is cleared only once a reward file has actually been
+    # read. Every early return below is therefore a grading failure by construction --
+    # fail-closed, so a new error path can never silently become a trainable zero.
     result = HarborEvaluationResult(
-        instance_id=instance_id, reward=0.0, resolved=False, reward_source="", eval_error=None
+        instance_id=instance_id,
+        reward=0.0,
+        resolved=False,
+        reward_source="",
+        eval_error=None,
+        grading_failed=True,
     )
 
     tests_dir = instance.get("tests_dir")
@@ -206,7 +272,13 @@ def evaluate_harbor_task(
         return result
 
     try:
-        # 1. Ship the task's tests in. The trailing /. copies directory *contents*, and
+        # 1. Create the destination. podman (unlike docker) will NOT create the target
+        #    directory for `cp` and fails with
+        #       Error: "/tests/" could not be found on container ...
+        #    which would zero the reward for every task.
+        env.execute("mkdir -p /tests")
+
+        # 2. Ship the task's tests in. The trailing /. copies directory *contents*, and
         #    `cp` preserves nested fixture trees that a heredoc would mangle.
         copy = subprocess.run(
             [container_tool, "cp", f"{tests_dir}/.", f"{container_id}:/tests/"],
@@ -219,19 +291,45 @@ def evaluate_harbor_task(
             result["eval_error"] = f"failed to copy tests into container: {copy.stderr.strip()[:400]}"
             return result
 
-        # 2. test.sh writes its verdict here; some scripts assume the dir exists.
-        env.execute({"command": f"mkdir -p {REWARD_DIR}"})
+        # 3. Restore the executable bit. Harbor task trees ship tests/*.sh mode 664 and
+        #    `cp` preserves that, but a good number of test.sh scripts invoke their
+        #    sibling directly (`/tests/run_script.sh`, not `bash /tests/run_script.sh`)
+        #    and would die with "Permission denied" after the tests appeared to upload
+        #    fine -- a 0 reward that looks like a failed solution.
+        env.execute("chmod -R +x /tests 2>/dev/null || true")
 
-        # 3. Harbor's test.sh conventionally bails out early when PWD=/, so run from /root.
-        obs = env.execute({"command": "bash /tests/test.sh"}, cwd="/root", timeout=int(timeout))
+        # 4. test.sh writes its verdict here; some scripts assume the dir exists.
+        #    NOTE: v1 signature is execute(command: str). On v2 it is execute(action: dict)
+        #    and a bare string raises AttributeError -- see requirements-miniswe.txt.
+        env.execute(f"mkdir -p {REWARD_DIR}")
+
+        # 5. Run the verifier from /root, matching tinker_cookbook's HarborReward.
+        #
+        #    Its stated reason -- "test.sh checks if PWD=/ and exits early" -- does not
+        #    hold for this task set: none of the 437 test.sh scripts branch on PWD=/, and
+        #    87 cd somewhere themselves. Kept anyway for parity with the reference and
+        #    because a non-/ PWD is the safer default for scripts that use relative paths.
+        #
+        #    The mkdir is the part that matters here. That reference targets Modal, whose
+        #    run_command tolerates a missing workdir; podman does not -- `exec -w /root`
+        #    on an image lacking it returns 127 without running anything (the container
+        #    survives, so this would surface as a mysterious empty verdict rather than a
+        #    crash). /root exists in every image sampled from this set and the containers
+        #    run as root, so the mkdir always succeeds and costs one exec.
+        env.execute("mkdir -p /root")
+        obs = env.execute("bash /tests/test.sh", cwd="/root", timeout=int(timeout))
         logger.debug("verifier returncode=%s", obs.get("returncode"))
 
-        # 4. The exit code is advisory; the reward file is authoritative.
+        # 6. The exit code is advisory; the reward file is authoritative.
         reward, source = _read_reward(env)
         result["reward"] = reward
         result["resolved"] = reward > 0
         result["reward_source"] = source
-        if not source.startswith("reward."):
+        # A fragile test.sh can exit 0 without ever scoring the run (failed dependency
+        # install, unmet precondition). That is indistinguishable from "tests failed" in
+        # the reward value alone, so only a real reward file counts as a verdict.
+        result["grading_failed"] = not source.startswith("reward.")
+        if result["grading_failed"]:
             result["eval_error"] = f"(truncated)\n{(obs.get('output') or '')[-1000:]}"
         return result
     except subprocess.TimeoutExpired:
@@ -263,7 +361,7 @@ def _read_reward(env: Any) -> tuple[float, str]:
 
 def _cat(env: Any, path: str) -> str:
     try:
-        obs = env.execute({"command": f"cat {path} 2>/dev/null"})
+        obs = env.execute(f"cat {path} 2>/dev/null")
     except Exception:  # noqa: BLE001
         return ""
     if obs.get("returncode", 1) != 0:

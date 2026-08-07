@@ -1,31 +1,33 @@
 # mini-swe-agent config for Harbor tasks.
 #
-# Templates are taken from examples/train/mini_swe_agent/swebench.yaml. Four things had to
-# change; each is marked ADAPTED. Three of them are v1->v2 schema fixes that the SWE-Bench
-# config also needs (uv.lock resolves mini-swe-agent==2.4.2, i.e. v2) -- they fail silently
-# rather than loudly, which is why they are easy to miss:
+# Schema targets mini-swe-agent v1 (pinned in requirements-miniswe.txt to the scaleapi
+# fork @ d74716a, which is 1.15.0). This is the same schema examples/train/mini_swe_agent
+# uses, so the templates below are lifted from swebench.yaml with only Harbor-specific
+# edits, each marked ADAPTED.
 #
-#   a) `action_observation_template` / `format_error_template` moved from `agent:` to the
-#      MODEL config (as `observation_template` / `format_error_template`). AgentConfig
-#      ignores unknown keys, so leaving them under `agent:` drops them without an error.
-#   b) `model_class` must be `litellm_textbased`. The v2 default is `LitellmModel`, which
-#      sends tools=[BASH_TOOL] and parses `tool_calls` -- incompatible with the ```bash
-#      prompts below, producing a FormatError every turn.
-#   c) `action_regex` must match ```bash; v2 defaults to ```mswea_bash_command```.
+# Do NOT carry this file onto mini-swe-agent 2.x without rewriting it. Under v2 the model
+# defaults to tool-calling (`tools=[BASH_TOOL]`), which cannot parse the ```bash blocks the
+# prompts below ask for; `action_observation_template` moves to the model config as
+# `observation_template`; and an `action_regex` is required because v2's default fence is
+# ```mswea_bash_command```. uv.lock currently resolves 2.4.2, which is why the pin exists.
 #
-# The fourth is genuinely Harbor-specific: Harbor grades the live container by running
-# tests/test.sh, so there is no git patch to emit and no /testbed.
+# Under v1 both AgentConfig and LitellmModelConfig are plain dataclasses, so an unknown key
+# in `agent:` or `model:` raises TypeError rather than being silently dropped. That is the
+# desired behaviour -- keep it that way by not adding v2-only keys "just in case".
+#
+# The Harbor-specific difference: Harbor grades the live container by running tests/test.sh,
+# so there is no git patch to emit and no /testbed.
 
 agent:
   system_template: |
-    You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.
-    Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).
+    You are a helpful assistant that can interact with a computer.
 
+    Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).
     Include a THOUGHT section before your command where you explain your reasoning process.
     Format your response as shown in <format_example>.
 
     <format_example>
-    THOUGHT: Your reasoning and analysis here
+    Your reasoning and analysis here. Explain why you want to perform the action.
 
     ```bash
     your_command_here
@@ -34,77 +36,37 @@ agent:
 
     Failure to follow these rules will cause your response to be rejected.
   instance_template: |
-    <task_description>
-    Consider the following task:
-    {{task}}
-    </task_description>
+    Please solve this issue: {{task}}
 
-    <instructions>
-    # Task Instructions
-
-    ## Overview
-    You're a software engineer interacting continuously with a computer by submitting commands.
-    You'll be helping implement necessary changes to meet the requirements in the task description.
-    Your task is specifically to make changes to files in the working directory in order to solve
-    the task described above in a way that is general and consistent with the codebase.
-
-    IMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.
-
-    For each response:
-    1. Include a THOUGHT section explaining your reasoning and what you're trying to accomplish
-    2. Provide exactly ONE bash command to execute
-
-    ## Important Boundaries
-    # ADAPTED: Harbor mounts its grader at /tests and its results at /logs. The SWE-Bench
-    # version scopes this to /testbed and forbids touching tests.
-    - MODIFY: Source files in the working directory
-    - DO NOT MODIFY: Anything under /tests or /logs -- these hold the grader and its output
+    You can execute bash commands and edit files to implement the necessary changes.
 
     ## Recommended Workflow
+
+    This workflows should be done step-by-step so that you can iterate on your changes and any possible problems.
+
     1. Analyze the codebase by finding and reading relevant files
     2. Create a script to reproduce the issue
     3. Edit the source code to resolve the issue
     4. Verify your fix works by running your script again
     5. Test edge cases to ensure your fix is robust
+    6. Submit your changes and finish your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+       Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
 
-    ## Command Execution Rules
-    You are operating in an environment where
-    1. You write a single command
-    2. The system executes that command in a subshell
-    3. You see the result
-    4. You write your next command
+    ## Important Rules
 
-    Each response should include:
-    1. A **THOUGHT** section where you explain your reasoning and plan
-    2. A single bash code block with your command
+    1. Every response must contain exactly one action
+    2. The action must be enclosed in triple backticks
+    3. Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+       However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
 
-    Format your responses like this:
+    <system_information>
+    {{system}} {{release}} {{version}} {{machine}}
+    </system_information>
 
-    <format_example>
-    THOUGHT: Here I explain my reasoning process, analysis of the current situation,
-    and what I'm trying to accomplish with the command below.
+    ## Formatting your response
 
-    ```bash
-    your_command_here
-    ```
-    </format_example>
+    Here is an example of a correct response:
 
-    Commands must be specified in a single bash code block:
-
-    ```bash
-    your_command_here
-    ```
-
-    **CRITICAL REQUIREMENTS:**
-    - Your response SHOULD include a THOUGHT section explaining your reasoning
-    - Your response MUST include EXACTLY ONE bash code block
-    - This bash block MUST contain EXACTLY ONE command (or a set of commands connected with && or ||)
-    - If you include zero or multiple bash blocks, or no command at all, YOUR RESPONSE WILL FAIL
-    - Do NOT try to run multiple independent commands in separate blocks in one response
-    - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
-    - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
-
-    Example of a CORRECT response:
     <example_response>
     THOUGHT: I need to understand the structure of the repository first. Let me check what files are in the current directory to get a better understanding of the codebase.
 
@@ -113,38 +75,10 @@ agent:
     ```
     </example_response>
 
-    Example of an INCORRECT response:
-    <example_response>
-    THOUGHT: I need to examine the codebase and then look at a specific file. I'll run multiple commands to do this.
-
-    ```bash
-    ls -la
-    ```
-
-    Now I'll read the file:
-
-    ```bash
-    cat file.txt
-    ```
-    </example_response>
-
-    If you need to run multiple commands, either:
-    1. Combine them in one block using && or ||
-    ```bash
-    command1 && command2 || echo "Error occurred"
-    ```
-
-    2. Wait for the first command to complete, see its output, then issue the next command in your following response.
-
-    ## Environment Details
-    - You have a full Linux shell environment
-    - Always use non-interactive flags (-y, -f) for commands
-    - Avoid interactive tools like vi, nano, or any that require user input
-    - If a command isn't available, you can install it
-
-    ## Useful Command Examples
+    ## Useful command examples
 
     ### Create a new file:
+
     ```bash
     cat <<'EOF' > newfile.py
     import numpy as np
@@ -154,6 +88,13 @@ agent:
     ```
 
     ### Edit files with sed:
+
+    {%- if system == "Darwin" -%}
+    <important>
+    You are on MacOS. For all the below examples, you need to use `sed -i ''` instead of `sed -i`.
+    </important>
+    {%- endif -%}
+
     ```bash
     # Replace all occurrences
     sed -i 's/old_string/new_string/g' filename.py
@@ -169,48 +110,18 @@ agent:
     ```
 
     ### View file content:
+
     ```bash
     # View specific lines with numbers
     nl -ba filename.py | sed -n '10,20p'
     ```
 
     ### Any other command you want to run
+
     ```bash
     anything
     ```
-
-    ## Submission
-    # ADAPTED: Harbor grades the live container by running tests/test.sh after you stop, so
-    # there is no patch to emit. The SWE-Bench version ends with
-    # `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached`.
-    # The marker itself is required: mini-swe-agent's Environment._check_finished raises
-    # Submitted only when the FIRST line of output is exactly this string and returncode==0.
-    When you've completed your work (reading, editing, testing), and cannot make further progress
-    issue exactly the following command:
-
-    ```bash
-    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
-    ```
-
-    This command will submit your work. Leave your changes in place on the filesystem --
-    the grader inspects the container as you leave it.
-    You cannot continue working (reading, editing, testing) in any way on this task after submitting.
-    </instructions>
-  step_limit: 20
-  cost_limit: 0.          # cost tracking is meaningless against a local policy
-
-model:
-  # ADAPTED (b): without this, v2 selects the tool-calling LitellmModel and every turn
-  # fails to parse, because the prompts above use ```bash text blocks.
-  model_class: litellm_textbased
-  # ADAPTED (c): v2 defaults to ```mswea_bash_command```.
-  action_regex: "```bash\\s*\\n(.*?)\\n```"
-  # litellm cannot price a local vLLM endpoint; without this it raises.
-  cost_tracking: ignore_errors
-  model_kwargs:
-    drop_params: true
-  # ADAPTED (a): v1 called this `action_observation_template` and put it under `agent:`.
-  observation_template: |
+  action_observation_template: |
     <returncode>{{output.returncode}}</returncode>
     {% if output.output | length < 10000 -%}
     <output>
@@ -237,8 +148,9 @@ model:
     {%- endif -%}
   format_error_template: |
     Please always provide EXACTLY ONE action in triple backticks, found {{actions|length}} actions.
-
-    Please format your action in triple backticks as shown in <response_example>.
+    If you want to end the task, please issue the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+    without any other command.
+    Else, please format your response exactly as follows:
 
     <response_example>
     Here are some thoughts about why you want to perform the action.
@@ -248,15 +160,43 @@ model:
     ```
     </response_example>
 
-    If you have completed your assignment, please consult the first message about how to
-    submit your solution (you will not be able to continue working on this task after that).
+    Note: In rare cases, if you need to reference a similar format in your command, you might have
+    to proceed in two steps, first writing TRIPLEBACKTICKSBASH, then replacing them with ```bash.
+  step_limit: 20
+  cost_limit: 0.          # cost tracking is meaningless against a local policy
+
+model:
+  # v1 LitellmModelConfig accepts only: model_name, model_kwargs, litellm_model_registry,
+  # set_cache_control, cost_tracking. It is a dataclass, so anything else is a TypeError --
+  # in particular the v2-only observation_template / format_error_template / action_regex
+  # belong under `agent:` (above) or nowhere.
+  #
+  # No model_class: v1's default for an `openai/...` name is LitellmModel, which is the
+  # text-based one that parses ```bash blocks. (v2 renamed that to `litellm_textbased` and
+  # made the tool-calling variant the default -- do not copy that key back here.)
+  cost_tracking: ignore_errors   # litellm cannot price a local vLLM endpoint
+  model_kwargs:
+    drop_params: true
 
 environment:
-  # ADAPTED: SWE-Bench images use /testbed. Harbor images set their own WORKDIR --
-  # CodeContests uses /app. Override per task set.
-  cwd: "/app"
+  # ADAPTED: SWE-Bench images use /testbed; Harbor images each set their own WORKDIR.
+  # This value is only a FALLBACK for images whose Dockerfile declares no WORKDIR --
+  # preprocess_harbor.py records the real one per task in instance["workdir"], and
+  # init_and_run overrides cwd with it. Keep this at "/" so it always exists: podman
+  # refuses to start a container whose workdir is missing.
+  cwd: "/"
   timeout: 180
   pull_timeout: 1200
+  # PID 1 in the container is `sleep <container_timeout>`, so this is a hard ceiling on
+  # agent time PLUS grading time. Set explicitly rather than relying on mini-swe-agent's
+  # default, which happens to be the same value.
+  #
+  # The worst case reaches this exactly: step_limit 20 x timeout 180s = 60 min of agent,
+  # plus the 3600s verifier that 27 tasks declare = 120 min. That worst case needs every
+  # one of the 20 commands to burn its full 180s, which is unlikely in practice -- but if
+  # a container dies mid-grade the verifier writes no reward file, so the trajectory is
+  # dropped as a grading failure rather than trained on as a false zero.
+  container_timeout: "2h"
   env:
     PAGER: cat
     MANPAGER: cat
@@ -270,4 +210,10 @@ environment:
 run:
   # Rendered with Jinja against the instance dict, then run once after the container starts.
   # Harbor's test.sh writes here and some scripts assume the directory already exists.
+  #
+  # This works only on v1: get_sb_environment() invokes it as `env.execute(<str>)`, which
+  # matches v1's `execute(command: str)`. On v2 the signature is `execute(action: dict)`
+  # and the string raises `AttributeError: 'str' object has no attribute 'get'` before the
+  # agent is ever constructed -- every trajectory returns empty and generate() fails the
+  # whole step with "Found no valid responses". One more reason the pin is not optional.
   env_startup_command: "mkdir -p /logs/verifier"

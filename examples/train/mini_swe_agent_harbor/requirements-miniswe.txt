@@ -1,0 +1,11 @@
+# Pin mini-swe-agent for this example only.
+#
+# The repo-wide constraint in pyproject.toml is `mini-swe-agent>=1.12.0` with no upper
+# bound, and uv.lock currently resolves 2.4.2 -- the v2 API, which is a breaking rewrite
+# of every surface this example touches (Environment.execute, Agent.run, the per-turn
+# hook, the model registry, and where observation templates live). This integration is
+# written against v1, so it must not float onto 2.x.
+#
+# Applied via `uv run --with-requirements` in run_mini_swe_harbor_8B.sh, which overrides
+# uv.lock for this invocation only and leaves the rest of the repo untouched.
+mini-swe-agent @ git+https://github.com/scaleapi/mini-swe-agent.git@d74716a3c8104a113f77cc9ab94cf407ecdcf1e9

@@ -6,18 +6,27 @@ unchanged. The ``instance`` dict carries the four fields the pipeline reads:
 
     instance_id        -- task dir name; used for image naming and trajectory filenames
     problem_statement  -- instruction.md; rendered by mini-swe-agent's instance_template
-    image_name         -- pre-built tag. get_docker_image_name() short-circuits on this, so
+    image_name         -- image to run. get_docker_image_name() short-circuits on this, so
                           the SWE-Bench registry-naming branch never runs
     tests_dir          -- absolute path to tests/, uploaded into the container at grade time
 
-Images are built **here**, ahead of training, rather than in the rollout path: a group of
-``n_samples_per_prompt`` Ray tasks would otherwise race N identical ``podman build`` calls.
+Where ``image_name`` comes from, in order:
+
+1. ``task.toml``'s ``[environment].docker_image`` -- the task's own prebuilt image. This is
+   the normal case and requires no build; the field is exactly the ``environment/Dockerfile``
+   already built and pushed.
+2. Otherwise a local ``podman build`` of ``environment/``, tagged content-addressed.
+   Built **here**, ahead of training, rather than in the rollout path: a group of
+   ``n_samples_per_prompt`` Ray tasks would otherwise race N identical builds.
+3. With ``--skip_build``, the content-addressed tag is written without building, on the
+   assumption it already exists on every worker. Pass ``--force_build`` to ignore (1) and
+   always build.
 
 Usage::
 
     uv run --isolated examples/train/mini_swe_agent_harbor/preprocess_harbor.py \\
-        --tasks_dir ~/data/harbor_tasks/CodeContests \\
-        --output_dir ~/data/harbor_codecontests
+        --tasks_dir ~/swebench-pro-tinker/ez_500_verified \\
+        --output_dir ~/data/harbor_ez500
 
 For a multi-node Ray cluster, ``--tasks_dir`` must be on shared storage (the grader reads
 ``tests_dir`` from whichever worker runs the trajectory), and the images must exist on every
@@ -39,8 +48,10 @@ from examples.train.mini_swe_agent_harbor.harbor_tasks import (  # noqa: E402
     DEFAULT_IMAGE_PREFIX,
     HarborTask,
     build_task_image,
+    declared_image,
     discover_tasks,
     image_tag,
+    task_workdir,
 )
 
 
@@ -54,6 +65,11 @@ def build_row(task: HarborTask, data_source: str, image_name: str) -> dict:
             "instance_id": task.name,
             "problem_statement": task.instruction,
             "image_name": image_name,
+            # The image's own WORKDIR. mini-swe-agent always passes `-w <cwd>`, and podman
+            # refuses to start a container whose workdir is missing, so this must be
+            # per-task rather than one value in the yaml. Empty when the Dockerfile
+            # declares none; the generator then falls back to the yaml's cwd.
+            "workdir": task_workdir(task) or "",
             "tests_dir": str(task.tests_dir),
             "task_dir": str(task.task_dir),
             # Surfaced for convenience; the generator reads timeouts from generator_cfg.
@@ -76,7 +92,16 @@ def main() -> None:
     parser.add_argument(
         "--skip_build",
         action="store_true",
-        help="only write parquet; assume images already exist (e.g. pulled from a registry)",
+        help=(
+            "for tasks with no [environment].docker_image, do not build -- assume the "
+            "synthesized tag already exists (e.g. built on another node, or pushed to a "
+            "registry under --image_prefix). No effect on tasks that declare an image."
+        ),
+    )
+    parser.add_argument(
+        "--force_build",
+        action="store_true",
+        help="ignore [environment].docker_image and build every task from its Dockerfile",
     )
     args = parser.parse_args()
 
@@ -91,9 +116,18 @@ def main() -> None:
 
     data_source = args.data_source or f"harbor/{tasks_dir.name.lower()}"
     rows, failed = [], []
+    n_declared, n_built, n_assumed = 0, 0, 0
     for index, task in enumerate(tasks, 1):
-        tag = image_tag(task, args.image_prefix)
-        if not args.skip_build:
+        # A task that names a prebuilt image in task.toml needs no build at all: that image
+        # IS the built Dockerfile. Only fall back to building when the field is absent.
+        declared = None if args.force_build else declared_image(task)
+        if declared:
+            tag = declared
+            n_declared += 1
+        elif args.skip_build:
+            tag = image_tag(task, args.image_prefix)
+            n_assumed += 1
+        else:
             try:
                 tag = build_task_image(
                     task,
@@ -101,6 +135,7 @@ def main() -> None:
                     prefix=args.image_prefix,
                     build_timeout=args.build_timeout,
                 )
+                n_built += 1
             except Exception as e:  # noqa: BLE001 - one bad Dockerfile shouldn't stop the set
                 print(f"[{index}/{len(tasks)}] BUILD FAILED {task.name}: {str(e)[:200]}")
                 failed.append(task.name)
@@ -108,6 +143,19 @@ def main() -> None:
         rows.append(build_row(task, data_source, tag))
         if index % 50 == 0 or index == len(tasks):
             print(f"[{index}/{len(tasks)}] prepared {len(rows)} tasks, {len(failed)} failed")
+
+    print(
+        f"\nimage sources: {n_declared} prebuilt (task.toml [environment].docker_image), "
+        f"{n_built} built locally, {n_assumed} assumed to exist (--skip_build)"
+    )
+    if n_assumed:
+        # These rows carry a locally-computed tag that nothing has created. Say so loudly:
+        # the rollout failure it produces is an opaque image-pull error much later.
+        print(
+            f"WARNING: {n_assumed} tasks have no [environment].docker_image and were not built. "
+            f"Their image_name is a synthesized '{args.image_prefix}/<task>:<digest>' tag that "
+            f"must already exist on every Ray worker, or generation will fail for them."
+        )
 
     if not rows:
         raise SystemExit("every task failed to build; nothing to write")

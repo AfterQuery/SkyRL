@@ -58,7 +58,7 @@ NNODES=1
 NUM_INFERENCE_ENGINES=6
 TP_SIZE=1
 LOGGER=console
-SP_SIZE=2
+SP_SIZE=1
 
 # Batch sizes must satisfy skyrl/train/utils/utils.py::validate_batch_sizes:
 #
@@ -104,8 +104,8 @@ uv run --isolated --extra fsdp --extra miniswe \
   trainer.eval_before_train=false \
   trainer.eval_interval=5 \
   trainer.update_epochs_per_batch=1 \
-  trainer.train_batch_size=6 \
-  trainer.policy_mini_batch_size=6 \
+  trainer.train_batch_size=64 \
+  trainer.policy_mini_batch_size=32 \
   trainer.micro_forward_batch_size_per_gpu=1 \
   trainer.micro_train_batch_size_per_gpu=1 \
   trainer.dump_data_batch=true \

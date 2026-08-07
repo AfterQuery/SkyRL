@@ -337,18 +337,24 @@ class MiniSweAgentHarborGenerator(MiniSweAgentGenerator):
             self.base_url,
         )
         if not len(messages):
-            return None, None, None, None, None, None
-
-        # The verifier never returned a verdict (dead container, upload failure, timeout,
-        # or a test.sh that exited without writing a reward file). Its 0.0 is an artefact
-        # of broken grading, not evidence the agent failed, so drop the trajectory rather
-        # than train on a false negative. `generate()` filters `None` responses out.
-        if grading_failed:
+            # The episode died before the agent said anything -- image pull failure,
+            # container start failure, a model that never answered. Environment noise, same
+            # class as a grading failure, so it must not train. But it also cannot be
+            # dropped: `validate_generator_output` asserts num_prompts == num_responses
+            # against the *input* batch, and the upstream generator's `return None, ...`
+            # here is exactly what produces "Mismatch between prompts (252) and responses
+            # (212)". Emit a minimal neutral row instead: prompt tokens from the input
+            # conversation (there are no `messages[:2]` to recover them from), a one-token
+            # response because downstream padding assumes non-empty rows, and a zero loss
+            # mask so it contributes nothing to the gradient.
             logger.warning(
-                f"Dropping trajectory for {env_extras['instance']['instance_id']}: "
-                f"grading produced no verdict ({error})"
+                f"Neutralizing trajectory for {env_extras['instance']['instance_id']}: "
+                f"agent produced no messages ({error})"
             )
-            return None, None, None, None, None, None
+            prompt_ids = self.tokenizer.apply_chat_template(
+                prompt, add_generation_prompt=True, return_dict=False, tokenize=True
+            )
+            return ([self.tokenizer.eos_token_id], 0.0, "generation_failed", [0], prompt_ids, None)
 
         # TODO (sumanthrh): This is currently hardcoded for SWEBench with 2 initial messages (system and user).
         response_messages = messages[2:]
@@ -396,5 +402,32 @@ class MiniSweAgentHarborGenerator(MiniSweAgentGenerator):
         # Truncate to maximum allowed length
         response_ids = response_ids[:max_response_tokens]
         loss_mask = loss_mask[:max_response_tokens]
+
+        # Two failure kinds, treated differently on purpose:
+        #
+        # * CONTEXT / LENGTH failures fall through untouched. If the agent overflowed its
+        #   budget or hit the step limit, `agent.run()` still leaves a mutated container,
+        #   grading still runs on it, and the resulting reward is a real verdict on a real
+        #   attempt. `stop_reason="length"` records it. That is legitimate signal -- the
+        #   policy should learn that burning the budget scores badly -- so it trains.
+        #
+        # * GRADING failures are noise about the environment, not about the policy: a dead
+        #   container, a failed test upload, a timed-out verifier, or a test.sh that exited
+        #   without writing a reward file. The 0.0 says nothing about the attempt.
+        #
+        # Grading failures cannot simply be dropped: the trainer asserts
+        # `num_prompts == num_responses` (trainer_utils.py::validate_generator_output),
+        # comparing against the *input* batch, so a short return crashes the step --
+        # "Mismatch between prompts (252) and responses (212)". The upstream SWE-Bench
+        # generator has the same latent bug; it only survives because its single failure
+        # path (no messages at all) is rare. So keep the row and zero its loss mask: it
+        # occupies its slot in the batch but contributes no gradient, which is a drop in
+        # every way that reaches the optimizer.
+        if grading_failed:
+            logger.warning(
+                f"Neutralizing trajectory for {env_extras['instance']['instance_id']}: "
+                f"grading produced no verdict ({error})"
+            )
+            return ([*response_ids], 0.0, "grading_failed", [0] * len(loss_mask), prompt_ids, None)
 
         return (response_ids, reward, stop_reason, loss_mask, prompt_ids, None)

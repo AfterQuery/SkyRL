@@ -1,0 +1,43 @@
+# Defaults for the Toolathlon harness invocation. Override any field from the CLI with
+# toolathlon_config.<key>=<value>. Loaded by main_toolathlon.load_toolathlon_config().
+
+# Root of the Toolathlon repository checkout (https://github.com/hkust-nlp/Toolathlon).
+# The repo must be set up per its README: configs/global_configs.py created,
+# docker/podman configured, the task image pulled, and app containers deployed
+# (bash global_preparation/deploy_containers.sh).
+repo_path: /home/ubuntu/Toolathlon
+
+# Subdirectory of <repo>/tasks containing the tasks.
+tasks_domain: finalpool
+
+# Decoupled runner: preprocess + eval run in the task container, the agent loop runs on the
+# host against SkyRL's inference endpoint.
+runner_script: scripts/run_single_decoupled.sh
+runmode: normal
+agent_framework: toolathlon_default
+
+# Model provider inside Toolathlon. "unified" reads TOOLATHLON_OPENAI_BASE_URL/_API_KEY,
+# which the generator points at SkyRL's endpoint; the served model name is passed verbatim.
+provider: unified
+api_key: dummy
+
+# Toolathlon run configuration template (relative to repo_path).
+eval_config: scripts/formal_run_v0.json
+
+# Task container image.
+image_name: lockon0927/toolathlon-task-image:1016beta
+
+# Max agent steps per task (single-turn mode).
+max_steps: 50
+
+# Where rollout dumps (traj_log.json, eval_res.json, logs) are written, grouped by
+# training step. Each trajectory gets its own subdirectory.
+dump_root: ~/toolathlon_rollouts
+
+# Hard wall-clock limit per task run (preprocess + agent loop + eval), in seconds.
+task_timeout_seconds: 3600
+
+# Maximum number of task containers running concurrently. Tasks in the same conflict group
+# (tasks/<domain>/task_conflict.json) and repetitions of the same task are additionally
+# serialized because they mutate shared external app state.
+max_concurrent_tasks: 8

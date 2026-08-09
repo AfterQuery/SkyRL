@@ -1,0 +1,43 @@
+# Defaults for the MCP-Atlas integration. Override any field from the CLI with
+# mcp_atlas_config.<key>=<value>. Loaded by main_mcp_atlas.load_mcp_atlas_config().
+
+# The long-running MCP-Atlas sandbox container (docker run -p 1984:1984 ... agent-environment).
+# One sandbox is shared by all rollouts: state (filesystem, memory graph, git trees) is global,
+# so same-task repetitions are serialized and recycling the container between epochs is
+# recommended for mutating tasks.
+sandbox_url: http://localhost:1984
+
+# Agent loop limits. The official eval uses max_turns=256 / max_tool_calls=100; smaller
+# values keep rollouts inside the training context budget.
+max_turns: 32
+max_tool_calls: 50
+
+# Truncate each tool observation to this many characters (null = uncapped, official default).
+tool_output_cap: 10000
+
+# Optional system prompt prepended to every task (official default: none).
+system_prompt: null
+
+# Timeouts (seconds).
+llm_timeout_seconds: 600
+tool_call_timeout_seconds: 60
+list_tools_timeout_seconds: 180
+
+# Maximum concurrent rollouts against the sandbox.
+max_concurrent_tasks: 8
+
+# Where per-trajectory conversation dumps are written, grouped by training step.
+dump_root: ~/mcp_atlas_rollouts
+
+# Claim-coverage LLM judge (the benchmark's reward metric). base_url/api_key/model fall back
+# to EVAL_LLM_BASE_URL / EVAL_LLM_API_KEY / EVAL_LLM_MODEL env vars. Must point at a real
+# LLM endpoint, never at the policy being trained. Set enabled=false only for rollout
+# debugging (all rewards become 0).
+judge:
+  enabled: true
+  model: null
+  base_url: null
+  api_key: null
+  timeout_seconds: 60
+  max_retries: 2
+  max_concurrency: 16

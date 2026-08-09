@@ -115,5 +115,11 @@ Settings live in `mcp_atlas_config.yaml`, overridable as `mcp_atlas_config.<key>
 - Many of the 500 tasks need API-key-gated servers (github, notion, airtable, mongodb,
   slack, ...); without keys those tool calls fail. Use `--available-tools-only` to keep only
   runnable tasks.
+- Known image issue (`1.2.7`, observed 2026-08): the 7 Python/uvx-based servers (arxiv,
+  calculator, cli-mcp-server, ddg-search, fetch, git, pubmed) fail at startup because `uvx`
+  resolves a current `mcp` library that is API-incompatible with the pinned server versions
+  (`UV_OFFLINE=1` does not help). Until fixed upstream, only ~13 no-key servers come online,
+  which shrinks the no-key task pool drastically — configure API keys for more servers, or
+  rebuild the image with `mcp` pinned in `mcp_server_template.json` (`--with mcp==<version>`).
 - The sandbox's 48h tool-response cache makes repeated identical tool calls deterministic and
   cheap (usually good for RL); `POST {sandbox}/cache-clear` resets it.

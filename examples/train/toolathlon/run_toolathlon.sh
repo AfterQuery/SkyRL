@@ -96,7 +96,7 @@ uv run --isolated --extra fsdp -m examples.train.toolathlon.main_toolathlon \
   trainer.max_ckpts_to_keep=5 \
   trainer.hf_save_interval=5 \
   trainer.policy.optimizer_config.lr=1.0e-6 \
-  trainer.logger=wandb \
+  trainer.logger=console \
   trainer.project_name=toolathlon \
   trainer.run_name=$RUN_NAME \
   trainer.resume_mode=latest \

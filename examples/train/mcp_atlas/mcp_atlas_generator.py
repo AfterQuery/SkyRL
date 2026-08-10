@@ -29,6 +29,7 @@ from skyrl.train.generators.base import (
     TrajectoryID,
 )
 from skyrl.train.generators.utils import (
+    get_custom_chat_template,
     get_response_ids_and_loss_mask_from_messages,
     get_rollout_metrics,
 )
@@ -85,6 +86,12 @@ class MCPAtlasGenerator(GeneratorInterface):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.base_url = inference_engine_client.get_endpoint_url()
+        # Honor generator.chat_template so re-tokenization uses the SAME template vLLM renders
+        # rollout prompts with. Without this the stock Qwen3 template would inject an empty
+        # <think></think> into every assistant turn of the training sequence -- tokens the
+        # policy never generated, carrying loss_mask=1.
+        self.custom_chat_template = get_custom_chat_template(generator_cfg.chat_template)
+        self._tokenizer_kwargs = {"chat_template": self.custom_chat_template} if self.custom_chat_template else {}
 
         self._served_model_name = generator_cfg.inference_engine.served_model_name
         assert self._served_model_name is not None, "generator.inference_engine.served_model_name must be set"
@@ -391,9 +398,13 @@ class MCPAtlasGenerator(GeneratorInterface):
             add_generation_prompt=False,
             tokenize=True,
             return_dict=False,
+            **self._tokenizer_kwargs,
         )
         response_ids, loss_mask, _ = get_response_ids_and_loss_mask_from_messages(
-            response_messages, self.tokenizer, assistant_logprobs=None
+            response_messages,
+            self.tokenizer,
+            assistant_logprobs=None,
+            tokenizer_kwargs=self._tokenizer_kwargs or None,
         )
 
         stop_reason = traj.stop_reason

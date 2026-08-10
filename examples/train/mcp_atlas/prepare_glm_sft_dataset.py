@@ -184,6 +184,14 @@ def main() -> None:
         "do not dominate the mixture.",
     )
     parser.add_argument(
+        "--prefer",
+        choices=["shortest", "longest", "first"],
+        default="shortest",
+        help="Tie-break for --one-per-task when several rollouts share the top coverage. "
+        "'shortest' keeps the fewest-tool-call run (same reward for less work, and it trims the "
+        "token weight easy tasks get under per-token loss normalization).",
+    )
+    parser.add_argument(
         "--max-tool-output-chars",
         type=int,
         default=10000,
@@ -220,14 +228,22 @@ def main() -> None:
             continue
         if args.max_tool_calls and int(row["tool_calls"] or 0) > args.max_tool_calls:
             continue
-        selected.append((row["task_id"], int(row["run"]), coverage, row["file"]))
+        selected.append((row["task_id"], int(row["run"]), coverage, row["file"], int(row["tool_calls"] or 0)))
 
     if args.one_per_task:
+        # Rank by coverage first, then break ties with --prefer. Ties are the common case at
+        # coverage 1.0: 256 of the 534 perfect tasks have all three rollouts perfect.
+        def sort_key(item):
+            _, run, coverage, _, n_calls = item
+            if args.prefer == "shortest":
+                return (-coverage, n_calls, run)
+            if args.prefer == "longest":
+                return (-coverage, -n_calls, run)
+            return (-coverage, run)
+
         best: Dict[str, tuple] = {}
-        for item in selected:
-            task_id, _, coverage, _ = item
-            if task_id not in best or coverage > best[task_id][2]:
-                best[task_id] = item
+        for item in sorted(selected, key=sort_key):
+            best.setdefault(item[0], item)
         selected = list(best.values())
 
     if not selected:
@@ -236,17 +252,17 @@ def main() -> None:
         f"Selected {len(selected)} rollouts from {len(rows)} "
         f"(status=graded, coverage>={args.min_coverage}"
         f"{', one per task' if args.one_per_task else ''}) "
-        f"covering {len({t for t, _, _, _ in selected})} tasks"
+        f"covering {len({t for t, _, _, _, _ in selected})} tasks"
     )
 
     # 2. Load each task's enabled_tools (includes distractors the teacher had to reject).
     enabled_by_task: Dict[str, List[str]] = {}
-    for task_id in {t for t, _, _, _ in selected}:
+    for task_id in {t for t, _, _, _, _ in selected}:
         toml_path = tasks_dir / "tasks" / task_id / "task.toml"
         if not toml_path.is_file():
             continue
         enabled_by_task[task_id] = _parse_toml_string_list(toml_path.read_text(), "enabled_tools")
-    missing_tasks = [t for t, _, _, _ in selected if t not in enabled_by_task]
+    missing_tasks = [t for t, _, _, _, _ in selected if t not in enabled_by_task]
     if missing_tasks:
         print(f"WARNING: {len(set(missing_tasks))} tasks missing task.toml; their rows get tools=[]")
 
@@ -255,7 +271,7 @@ def main() -> None:
     converted: List[tuple] = []
     total_missing_results = 0
     skipped = 0
-    for task_id, run, coverage, relpath in selected:
+    for task_id, run, coverage, relpath, _ in selected:
         path = traj_dir / relpath
         if not path.is_file():
             skipped += 1

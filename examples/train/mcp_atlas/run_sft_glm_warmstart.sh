@@ -38,11 +38,14 @@ EXPORT_PATH="$STORAGE_ROOT/hf_exports"
 # truncated, which would cut a trajectory's final answer -- raise to 32768 to keep all.
 MAX_LENGTH=16384
 
-# 683 train rows; at batch_size 16 that is ~43 steps/epoch.
+# With --min-coverage 1.0 --one-per-task the dataset is 505 train rows, so at batch_size 32
+# that is ~15 steps/epoch (~31 steps for 2 epochs). SAVE_INTERVAL/eval_interval above that
+# total means the only checkpoint is the final one -- set it to ~15 to land on epoch
+# boundaries, or leave it high to save just once at the end.
 NUM_EPOCHS=2
-BATCH_SIZE=16
+BATCH_SIZE=32
 MICRO_BATCH_PER_GPU=1
-SAVE_INTERVAL=43   # ~once per epoch, so the exported checkpoint lands at epoch boundaries
+SAVE_INTERVAL=100
 
 # LR is the main knob here: this is a small, high-quality distillation set, so too high
 # washes out the base model's general ability and too low leaves tool-call formatting unlearned.

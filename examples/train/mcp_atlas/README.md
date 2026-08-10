@@ -101,7 +101,7 @@ uv run examples/train/mcp_atlas/prepare_glm_sft_dataset.py \
   --trajectories-dir ~/AQ-MCP-Atlas-1000-Trajectories-GLM-5.2 \
   --tasks-dir ~/AQ-MCP-Atlas-1000-Tasks \
   --output-dir ~/data/mcp_atlas_sft \
-  --min-coverage 0.75 --one-per-task
+  --min-coverage 1.0 --one-per-task
 
 bash examples/train/mcp_atlas/run_sft_glm_warmstart.sh          # Qwen3-8B, FSDP, 8 GPUs
 ```
@@ -110,7 +110,7 @@ Then start RL from the exported checkpoint:
 
 ```bash
 bash examples/train/mcp_atlas/run_mcp_atlas.sh \
-  trainer.policy.model.path=$HOME/mcp_atlas_sft_run/hf_exports/global_step_86
+  trainer.policy.model.path=$HOME/mcp_atlas_sft_run/hf_exports/global_step_32
 ```
 
 The converter handles three things that matter:
@@ -128,22 +128,35 @@ The converter handles three things that matter:
   called* — so the student faces the same choice the teacher did. Tools never called anywhere
   get an empty parameter object; load the runtime image if you need exact schemas.
 
-Selection knobs: `--min-coverage 0.75 --one-per-task` yields 718 rollouts over 718 tasks
-(683 train / 35 validation). Dropping `--one-per-task` gives ~1862 rows but lets easy tasks
-with three good runs dominate; `--min-coverage 0.99` keeps only near-perfect demonstrations.
+Selection knobs: `--min-coverage 1.0 --one-per-task` yields 531 rollouts over 531 tasks
+(505 train / 26 validation). Dropping `--one-per-task` gives 1207 rows, but 256 of those 534 tasks have all three runs
+perfect, so easy tasks would supply 64% of the data; measured across pairs of perfect runs the
+extra rollouts are largely redundant (mean tool-set Jaccard 0.855). `--prefer shortest`
+(default) breaks the frequent coverage-1.0 ties toward the fewest-tool-call demonstration.
 Rollouts with `status != graded` are always excluded — those are GLM never terminating
 (one hit 1053 tool calls), which carry no answer to learn from.
 
-Measured token lengths on this dataset (Qwen3-8B tokenizer): median 2733, p90 4771,
-p99 12063, max 28475 — hence `max_length=16384` in the run script, which keeps ~99.5% of
-trajectories whole. The prep script prints these stats so the value can be re-derived if you
-change the filters.
+**Reasoning and the chat template.** GLM's reasoning traces were not saved in the bundle, so
+the stock Qwen3 template injects an empty `<think>\n\n</think>` into *every* assistant turn —
+and those tokens land inside the trained span (loss_mask=1), which actively teaches the model
+to skip reasoning. `enable_thinking=False` does not suppress it for completed messages.
 
-**Note on reasoning:** GLM's reasoning traces were not saved in the bundle, so Qwen3's chat
-template renders an empty `<think></think>` before each assistant turn. The student therefore
-learns to act without visible reasoning. If you would rather preserve thinking, use
-`skyrl/train/utils/templates/qwen3_acc_thinking.jinja2` — decide before a real run, since it
-shapes the policy RL starts from.
+The fix is `skyrl/train/utils/templates/qwen3_acc_thinking.jinja2`, which never injects a think
+block and never strips reasoning from earlier turns. Since `SFTConfig` has no `chat_template`
+field (the online-tokenization worker passes a fixed argument tuple), the prep script emits the
+dataset **pre-tokenized** — `input_ids` plus a full-sequence `loss_mask`, consumed via
+`pretokenized_dataset_paths`. `run_mcp_atlas.sh` serves the same template to vLLM via
+`engine_init_kwargs.chat_template`, so SFT and rollout serialization match.
+
+Matching matters beyond the empty block: the stock template strips reasoning from all but the
+last assistant turn, so a thinking policy's rollout context and its re-tokenized training
+sequence would disagree — RL would compute logprobs on a context the policy never had.
+
+Measured over all 531 rows (Qwen3-8B tokenizer): mean 3088 tokens, median 2599, p90 4252,
+p99 11134, max 28558; trained tokens mean 788 / max 2591 (25.5% of all tokens, the rest being
+the tool-schema block and observations). `max_length=16384` keeps 529/531 rows whole.
+Pass `--no-pretokenize` to emit `messages`/`tools` for the online path instead, accepting the
+injected think blocks.
 
 ## Training
 

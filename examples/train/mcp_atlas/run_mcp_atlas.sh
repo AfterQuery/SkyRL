@@ -42,6 +42,12 @@ N_SAMPLES_PER_PROMPT=4
 TRAIN_BATCH_SIZE=8
 MAX_MODEL_LEN=32768
 
+# Serve rollouts with the same template the SFT data was tokenized with. It never injects an
+# empty <think></think> block and never strips reasoning from earlier turns, so multi-turn
+# history stays strictly appending -- required for the generator's re-tokenization to describe
+# the sequence the policy actually generated from.
+CHAT_TEMPLATE_PATH="$(dirname "$0")/../../../skyrl/train/utils/templates/qwen3_acc_thinking.jinja2"
+
 #----------------
 # Infrastructure setup
 #----------------
@@ -74,6 +80,7 @@ uv run --isolated --extra fsdp -m examples.train.mcp_atlas.main_mcp_atlas \
   generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \
   generator.inference_engine.tensor_parallel_size=$TP_SIZE \
   generator.inference_engine.engine_init_kwargs.max_model_len=$MAX_MODEL_LEN \
+  generator.inference_engine.engine_init_kwargs.chat_template=$CHAT_TEMPLATE_PATH \
   generator.inference_engine.engine_init_kwargs.enable_auto_tool_choice=true \
   generator.inference_engine.engine_init_kwargs.tool_call_parser=hermes \
   generator.inference_engine.gpu_memory_utilization=0.8 \

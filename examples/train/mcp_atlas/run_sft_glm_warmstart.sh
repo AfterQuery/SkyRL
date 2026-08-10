@@ -9,7 +9,10 @@ set -xeou pipefail
 # from a zero-reward start.
 #
 # Prerequisites:
-#   1. Unzip both bundles (trajectories + tasks), then build the SFT dataset:
+#   1. Unzip both bundles (trajectories + tasks), then build the SFT dataset. It is emitted
+#      pre-tokenized (input_ids + full-sequence loss_mask) with qwen3_acc_thinking.jinja2,
+#      because SFTConfig has no chat_template knob and the stock Qwen3 template injects an
+#      empty <think></think> into every assistant turn inside the trained span:
 #        uv run examples/train/mcp_atlas/prepare_glm_sft_dataset.py \
 #          --trajectories-dir ~/AQ-MCP-Atlas-1000-Trajectories-GLM-5.2 \
 #          --tasks-dir ~/AQ-MCP-Atlas-1000-Tasks \
@@ -58,19 +61,14 @@ uv run --isolated --extra fsdp \
     python -m skyrl.train.main_sft \
     strategy=fsdp \
     model.path="$MODEL_PATH" \
-    train_datasets="['$DATA_DIR']" \
-    train_dataset_splits="['train']" \
-    eval_datasets="['$DATA_DIR']" \
-    eval_dataset_splits="['validation']" \
+    pretokenized_dataset_paths="['$DATA_DIR/train.parquet']" \
+    eval_pretokenized_dataset_paths="['$DATA_DIR/validation.parquet']" \
     eval_interval="$SAVE_INTERVAL" \
-    messages_key=messages \
-    tools_key=tools \
     max_length=$MAX_LENGTH \
     num_epochs=$NUM_EPOCHS \
     batch_size=$BATCH_SIZE \
     micro_train_batch_size_per_gpu=$MICRO_BATCH_PER_GPU \
     remove_microbatch_padding=true \
-    train_on_what="all_assistant_messages" \
     seed=42 \
     optimizer_config.lr=$LR \
     optimizer_config.weight_decay=1e-2 \

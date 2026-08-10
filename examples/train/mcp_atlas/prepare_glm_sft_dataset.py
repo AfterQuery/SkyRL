@@ -166,6 +166,48 @@ def build_tool_schemas(enabled_tools: List[str], observed_args: Dict[str, Dict[s
     return schemas
 
 
+def pretokenize_row(
+    messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], tokenizer, chat_template: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Tokenize one conversation into ``input_ids`` + a full-sequence ``loss_mask``.
+
+    Mirrors ``sft_trainer._tokenize_chat_all_assistants`` (the path
+    ``train_on_what=all_assistant_messages`` would take) so the only difference from online
+    tokenization is the chat template: leading non-assistant messages are rendered with the
+    tool schemas and masked out, then every later message is encoded individually by
+    ``get_response_ids_and_loss_mask_from_messages``, which masks user/tool observations.
+    Returns None when the conversation has no assistant turn.
+    """
+    from skyrl.train.generators.utils import get_response_ids_and_loss_mask_from_messages
+
+    tokenizer_kwargs: Dict[str, Any] = {}
+    if tools:
+        tokenizer_kwargs["tools"] = tools
+    if chat_template:
+        tokenizer_kwargs["chat_template"] = chat_template
+
+    first_assistant = next((i for i, m in enumerate(messages) if m["role"] == "assistant"), None)
+    if first_assistant is None:
+        return None
+
+    prompt_ids = tokenizer.apply_chat_template(
+        messages[:first_assistant],
+        add_generation_prompt=False,
+        tokenize=True,
+        return_dict=False,
+        **tokenizer_kwargs,
+    )
+    response_ids, response_mask, _ = get_response_ids_and_loss_mask_from_messages(
+        messages[first_assistant:], tokenizer, tokenizer_kwargs=tokenizer_kwargs
+    )
+    # The pretokenized loader wants loss_mask aligned 1:1 with input_ids and infers
+    # num_actions from the first nonzero entry, so zero out the prompt span here.
+    return {
+        "input_ids": prompt_ids + response_ids,
+        "loss_mask": [0] * len(prompt_ids) + response_mask,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--trajectories-dir", required=True, help="Extracted GLM trajectories bundle.")
@@ -203,7 +245,31 @@ def main() -> None:
     parser.add_argument(
         "--tokenizer",
         default="Qwen/Qwen3-8B",
-        help="Tokenizer used only to report sequence-length stats for choosing max_length.",
+        help="Tokenizer for pre-tokenization and sequence-length stats.",
+    )
+    parser.add_argument(
+        "--pretokenize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Emit `input_ids` + full-sequence `loss_mask` for SFTConfig.pretokenized_dataset_paths "
+        "(default). This is the only way to control the chat template, since SFTConfig has no "
+        "chat_template field: the stock Qwen3 template injects an empty `<think></think>` into every "
+        "assistant turn *inside the trained span*, teaching the model to skip reasoning. "
+        "Use --no-pretokenize to emit `messages`/`tools` for online tokenization instead.",
+    )
+    parser.add_argument(
+        "--chat-template",
+        default=str(
+            Path(__file__).resolve().parents[3]
+            / "skyrl"
+            / "train"
+            / "utils"
+            / "templates"
+            / "qwen3_acc_thinking.jinja2"
+        ),
+        help="Jinja chat template used for pre-tokenization. The default never injects a think block "
+        "and never strips reasoning from earlier turns, so it matches what RL should serve via "
+        "generator.inference_engine.engine_init_kwargs.chat_template. Pass '' for the tokenizer default.",
     )
     args = parser.parse_args()
 
@@ -314,6 +380,34 @@ def main() -> None:
 
     rng = random.Random(args.seed)
     rng.shuffle(out_rows)
+
+    tokenizer = None
+    if args.pretokenize:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+        chat_template = None
+        if args.chat_template:
+            chat_template = Path(args.chat_template).expanduser().read_text()
+            print(f"Pre-tokenizing with chat template {args.chat_template}")
+        else:
+            print(f"Pre-tokenizing with the {args.tokenizer} default chat template")
+
+        tokenized_rows, dropped = [], 0
+        for row in out_rows:
+            tokenized = pretokenize_row(row["messages"], json.loads(row["tools"]) or None, tokenizer, chat_template)
+            if tokenized is None or sum(tokenized["loss_mask"]) == 0:
+                dropped += 1
+                continue
+            tokenized_rows.append({**tokenized, "task_id": row["task_id"], "coverage": row["coverage"]})
+        if dropped:
+            print(f"Dropped {dropped} rows with no trainable assistant tokens")
+        out_rows = tokenized_rows
+
+        think_ids = {tid for tag in ("<think>", "</think>") for tid in tokenizer.encode(tag, add_special_tokens=False)}
+        with_think = sum(1 for r in out_rows if think_ids & set(r["input_ids"]))
+        print(f"Rows containing a <think> tag: {with_think}/{len(out_rows)} (0 means no empty blocks injected)")
+
     num_val = int(len(out_rows) * args.val_fraction) if args.val_fraction > 0 else 0
     val_rows, train_rows = out_rows[:num_val], out_rows[num_val:]
 
@@ -327,13 +421,20 @@ def main() -> None:
         pd.DataFrame(val_rows).to_parquet(output_dir / "validation.parquet", index=False)
     print(f"Wrote {len(train_rows)} train / {len(val_rows)} val rows to {output_dir}")
 
-    # 5. Report token lengths so max_length can be set without guessing.
-    try:
-        from transformers import AutoTokenizer
+    # Report sequence lengths so max_length can be chosen rather than guessed.
+    if args.pretokenize:
+        lengths = sorted(len(r["input_ids"]) for r in out_rows)
+        trained = [sum(r["loss_mask"]) for r in out_rows]
+    else:
+        try:
+            from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+            tokenizer = tokenizer or AutoTokenizer.from_pretrained(args.tokenizer)
+        except Exception as exc:  # noqa: BLE001
+            print(f"(skipped token-length report: {exc})")
+            return
         sample = out_rows if len(out_rows) <= 400 else rng.sample(out_rows, 400)
-        lengths = []
+        lengths, trained = [], []
         for row in sample:
             # return_dict=False keeps this a plain id list; with return_dict the call yields a
             # BatchEncoding whose len() is its key count, not the sequence length.
@@ -346,15 +447,21 @@ def main() -> None:
             )
             lengths.append(len(ids))
         lengths.sort()
-        pct = lambda p: lengths[min(len(lengths) - 1, int(len(lengths) * p))]  # noqa: E731
+
+    def pct(p):
+        return lengths[min(len(lengths) - 1, int(len(lengths) * p))]
+
+    print(
+        f"Sequence lengths over {len(lengths)} rows ({args.tokenizer}): "
+        f"mean={sum(lengths) // len(lengths)} median={pct(0.5)} p90={pct(0.9)} p99={pct(0.99)} max={lengths[-1]}"
+    )
+    if trained:
         print(
-            f"Token lengths over {len(lengths)} sampled rows ({args.tokenizer}): "
-            f"median={pct(0.5)} p90={pct(0.9)} p99={pct(0.99)} max={lengths[-1]}"
+            f"Trained (loss_mask=1) tokens per row: mean={sum(trained) // len(trained)} "
+            f"max={max(trained)}  -> {100 * sum(trained) / sum(lengths):.1f}% of all tokens"
         )
-        for limit in (8192, 16384, 32768):
-            print(f"  fit within max_length={limit}: {sum(1 for n in lengths if n <= limit)}/{len(lengths)}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"(skipped token-length report: {exc})")
+    for limit in (8192, 16384, 32768):
+        print(f"  fit within max_length={limit}: {sum(1 for n in lengths if n <= limit)}/{len(lengths)}")
 
 
 if __name__ == "__main__":

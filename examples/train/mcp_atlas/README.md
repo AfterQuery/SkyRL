@@ -86,6 +86,65 @@ uv run --isolated --extra fsdp -m examples.train.mcp_atlas.main_mcp_atlas_genera
 Inspect per-trajectory conversation dumps under `mcp_atlas_config.dump_root`
 (default `~/mcp_atlas_rollouts`).
 
+## Warm start: SFT on GLM-5.2 teacher trajectories
+
+RL from a cold start is expensive here: an 8B model that emits malformed tool calls earns
+coverage 0 on every rollout, so GRPO sees no reward variance and no gradient. Distilling a
+stronger teacher's tool-use behaviour first gives RL a policy that already calls tools
+correctly.
+
+Inputs are the two AfterQuery bundles (1000 Harbor-schema MCP-Atlas tasks, and 3 GLM-5.2
+rollouts per task graded with the same claim-coverage judge). Unzip both, then:
+
+```bash
+uv run examples/train/mcp_atlas/prepare_glm_sft_dataset.py \
+  --trajectories-dir ~/AQ-MCP-Atlas-1000-Trajectories-GLM-5.2 \
+  --tasks-dir ~/AQ-MCP-Atlas-1000-Tasks \
+  --output-dir ~/data/mcp_atlas_sft \
+  --min-coverage 0.75 --one-per-task
+
+bash examples/train/mcp_atlas/run_sft_glm_warmstart.sh          # Qwen3-8B, FSDP, 8 GPUs
+```
+
+Then start RL from the exported checkpoint:
+
+```bash
+bash examples/train/mcp_atlas/run_mcp_atlas.sh \
+  trainer.policy.model.path=$HOME/mcp_atlas_sft_run/hf_exports/global_step_86
+```
+
+The converter handles three things that matter:
+
+- **Anthropic → OpenAI messages.** The bundle stores assistant `content` as a block list
+  (`text` / `tool_use` with a JSON-string `input`) and results under `tool_use_id`;
+  `SFTTrainer` needs text content plus a `tool_calls` list and `tool_call_id`.
+- **Observations flattened exactly as the RL generator flattens them** (MCP blocks joined on
+  `text`, capped at `--max-tool-output-chars`, default 10000 = the generator's
+  `tool_output_cap`). A different observation format in SFT than RL produces is the main
+  avoidable train/rollout mismatch.
+- **Tool schemas reconstructed from teacher usage**, because neither bundle ships them (they
+  live in the `mcp-atlas-runtime` image). Argument keys are unioned per tool name; every tool
+  in the task's `enabled_tools` is included — *including distractors the teacher never
+  called* — so the student faces the same choice the teacher did. Tools never called anywhere
+  get an empty parameter object; load the runtime image if you need exact schemas.
+
+Selection knobs: `--min-coverage 0.75 --one-per-task` yields 718 rollouts over 718 tasks
+(683 train / 35 validation). Dropping `--one-per-task` gives ~1862 rows but lets easy tasks
+with three good runs dominate; `--min-coverage 0.99` keeps only near-perfect demonstrations.
+Rollouts with `status != graded` are always excluded — those are GLM never terminating
+(one hit 1053 tool calls), which carry no answer to learn from.
+
+Measured token lengths on this dataset (Qwen3-8B tokenizer): median 2733, p90 4771,
+p99 12063, max 28475 — hence `max_length=16384` in the run script, which keeps ~99.5% of
+trajectories whole. The prep script prints these stats so the value can be re-derived if you
+change the filters.
+
+**Note on reasoning:** GLM's reasoning traces were not saved in the bundle, so Qwen3's chat
+template renders an empty `<think></think>` before each assistant turn. The student therefore
+learns to act without visible reasoning. If you would rather preserve thinking, use
+`skyrl/train/utils/templates/qwen3_acc_thinking.jinja2` — decide before a real run, since it
+shapes the policy RL starts from.
+
 ## Training
 
 ```bash

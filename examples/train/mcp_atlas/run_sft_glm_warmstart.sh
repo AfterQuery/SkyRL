@@ -17,7 +17,9 @@ set -xeou pipefail
 #          --trajectories-dir ~/AQ-MCP-Atlas-1000-Trajectories-GLM-5.2 \
 #          --tasks-dir ~/AQ-MCP-Atlas-1000-Tasks \
 #          --output-dir ~/data/mcp_atlas_sft --min-coverage 0.75 --one-per-task
-#   2. export WANDB_API_KEY=<key>   (or leave logger=console)
+#   2. export WANDB_API_KEY=<key>    (metrics go to W&B; set logger=console to disable)
+#   3. HuggingFace auth for the ~61 GB Qwen3-30B-A3B pull: `huggingface-cli login` or
+#      export HF_TOKEN=<token>. Unauthenticated pulls of this size get rate limited.
 #
 # Usage:
 #   bash examples/train/mcp_atlas/run_sft_glm_warmstart.sh [extra overrides...]
@@ -36,6 +38,7 @@ set -xeou pipefail
 : "${DATA_DIR:="$HOME/data/mcp_atlas_sft"}"
 : "${STORAGE_ROOT:="$HOME/mcp_atlas_sft_run"}"
 : "${MODEL_PATH:="Qwen/Qwen3-30B-A3B"}"
+RUN_NAME="$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')_glm_warmstart_lora"
 
 CKPT_PATH="$STORAGE_ROOT/ckpts"
 EXPORT_PATH="$STORAGE_ROOT/hf_exports"
@@ -56,7 +59,7 @@ MAX_LENGTH=32768
 NUM_EPOCHS=2
 BATCH_SIZE=32
 MICRO_BATCH_PER_GPU=1
-SAVE_INTERVAL=100
+SAVE_INTERVAL=50
 
 # LoRA. rank/alpha are the capacity knobs; scale = alpha/rank = 2 here.
 #
@@ -71,7 +74,7 @@ LORA_TARGETS="[q_proj,k_proj,v_proj,o_proj]"
 
 # LoRA wants a markedly higher LR than full fine-tuning (only the adapters move).
 # Warmup is short because the whole run is only ~31 steps at batch_size 32.
-LR=1e-4
+LR=1e-5
 WARMUP_STEPS=5
 
 NUM_GPUS=8
@@ -85,7 +88,7 @@ uv run --isolated --extra fsdp \
     model.lora.target_modules="$LORA_TARGETS" \
     pretokenized_dataset_paths="['$DATA_DIR/train.parquet']" \
     eval_pretokenized_dataset_paths="['$DATA_DIR/validation.parquet']" \
-    eval_interval="$SAVE_INTERVAL" \
+    eval_interval=5 \
     max_length=$MAX_LENGTH \
     num_epochs=$NUM_EPOCHS \
     batch_size=$BATCH_SIZE \
@@ -102,9 +105,10 @@ uv run --isolated --extra fsdp \
     placement.num_gpus_per_node=$NUM_GPUS \
     fsdp_config.cpu_offload=false \
     fsdp_config.reshard_after_forward=true \
-    logger=console \
+    logger=wandb \
     project_name=mcp_atlas_sft \
-    run_name=qwen3_8b_glm_warmstart \
+    run_name=$RUN_NAME \
+    tags="[sft,lora,qwen3-30b-a3b,glm-teacher]" \
     ckpt_path="$CKPT_PATH" \
     ckpt_interval=$SAVE_INTERVAL \
     hf_save_interval=0 \

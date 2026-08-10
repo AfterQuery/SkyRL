@@ -22,13 +22,20 @@ set -xeou pipefail
 # Usage:
 #   bash examples/train/mcp_atlas/run_sft_glm_warmstart.sh [extra overrides...]
 #
-# The exported HF checkpoint feeds straight into RL:
+# With LoRA, checkpoints contain a PEFT adapter at
+#   $CKPT_PATH/global_step_<N>/policy/lora_adapter/
+# and NOT a merged model -- SkyRL has no merge_and_unload anywhere, so hf_save_interval is
+# left at 0 rather than producing a misleading "export". Merge before RL:
+#   uv run examples/train/mcp_atlas/merge_lora_adapter.py \
+#     --base Qwen/Qwen3-30B-A3B \
+#     --adapter $CKPT_PATH/global_step_<N>/policy/lora_adapter \
+#     --output $HOME/mcp_atlas_sft_run/merged
 #   bash examples/train/mcp_atlas/run_mcp_atlas.sh \
-#     trainer.policy.model.path=$EXPORT_PATH/global_step_<N>
+#     trainer.policy.model.path=$HOME/mcp_atlas_sft_run/merged
 
 : "${DATA_DIR:="$HOME/data/mcp_atlas_sft"}"
 : "${STORAGE_ROOT:="$HOME/mcp_atlas_sft_run"}"
-: "${MODEL_PATH:="Qwen/Qwen3-8B"}"
+: "${MODEL_PATH:="Qwen/Qwen3-30B-A3B"}"
 
 CKPT_PATH="$STORAGE_ROOT/ckpts"
 EXPORT_PATH="$STORAGE_ROOT/hf_exports"
@@ -36,10 +43,11 @@ EXPORT_PATH="$STORAGE_ROOT/hf_exports"
 #-----------------------
 # Training setup
 #-----------------------
-# Sequence length: measured token lengths over this dataset are median ~2.7k, p99 ~12k,
-# max ~28k, so 16384 keeps ~99.5% of trajectories intact. Rows longer than this are
-# truncated, which would cut a trajectory's final answer -- raise to 32768 to keep all.
-MAX_LENGTH=16384
+# Sequence length: measured over all 531 rows the max is 28558 tokens, so 32768 keeps every
+# trajectory whole. Rows above max_length are truncated from the end, which would amputate the
+# final answer -- the single most valuable training target -- so do not lower this without
+# re-checking the prep script's length report.
+MAX_LENGTH=32768
 
 # With --min-coverage 1.0 --one-per-task the dataset is 505 train rows, so at batch_size 32
 # that is ~15 steps/epoch (~31 steps for 2 epochs). SAVE_INTERVAL/eval_interval above that
@@ -50,10 +58,21 @@ BATCH_SIZE=32
 MICRO_BATCH_PER_GPU=1
 SAVE_INTERVAL=100
 
-# LR is the main knob here: this is a small, high-quality distillation set, so too high
-# washes out the base model's general ability and too low leaves tool-call formatting unlearned.
-LR=1e-5
-WARMUP_STEPS=10
+# LoRA. rank/alpha are the capacity knobs; scale = alpha/rank = 2 here.
+#
+# target_modules is attention-only ON PURPOSE. Qwen3-30B-A3B is an MoE with 128 experts per
+# layer across 48 layers, so the default "all-linear" would attach adapters to every expert
+# projection -- ~18k LoRA modules -- which is slow and memory-hungry for little benefit.
+# NOTE: the bracket form below parses to a real list; a comma-separated *string* would be
+# passed to PEFT as one module name and silently train nothing.
+LORA_RANK=32
+LORA_ALPHA=64
+LORA_TARGETS="[q_proj,k_proj,v_proj,o_proj]"
+
+# LoRA wants a markedly higher LR than full fine-tuning (only the adapters move).
+# Warmup is short because the whole run is only ~31 steps at batch_size 32.
+LR=1e-4
+WARMUP_STEPS=5
 
 NUM_GPUS=8
 
@@ -61,6 +80,9 @@ uv run --isolated --extra fsdp \
     python -m skyrl.train.main_sft \
     strategy=fsdp \
     model.path="$MODEL_PATH" \
+    model.lora.rank=$LORA_RANK \
+    model.lora.alpha=$LORA_ALPHA \
+    model.lora.target_modules="$LORA_TARGETS" \
     pretokenized_dataset_paths="['$DATA_DIR/train.parquet']" \
     eval_pretokenized_dataset_paths="['$DATA_DIR/validation.parquet']" \
     eval_interval="$SAVE_INTERVAL" \
@@ -69,6 +91,7 @@ uv run --isolated --extra fsdp \
     batch_size=$BATCH_SIZE \
     micro_train_batch_size_per_gpu=$MICRO_BATCH_PER_GPU \
     remove_microbatch_padding=true \
+    dataloader_num_workers=2 \
     seed=42 \
     optimizer_config.lr=$LR \
     optimizer_config.weight_decay=1e-2 \
@@ -84,7 +107,7 @@ uv run --isolated --extra fsdp \
     run_name=qwen3_8b_glm_warmstart \
     ckpt_path="$CKPT_PATH" \
     ckpt_interval=$SAVE_INTERVAL \
-    hf_save_interval=$SAVE_INTERVAL \
+    hf_save_interval=0 \
     export_path="$EXPORT_PATH" \
     resume_from="" \
     "$@"

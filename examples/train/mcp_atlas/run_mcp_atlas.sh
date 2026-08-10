@@ -33,6 +33,20 @@ CKPTS_DIR="$STORAGE_ROOT/ckpts"
 EXPORTS_DIR="$STORAGE_ROOT/exports"
 LOG_DIR="$STORAGE_ROOT/logs"
 
+# Policy. Point this at the merged SFT checkpoint to warm start (see run_sft_glm_warmstart.sh
+# and merge_lora_adapter.py); the bare base model trains from scratch.
+: "${MODEL_PATH:="Qwen/Qwen3-30B-A3B"}"
+SERVED_MODEL_NAME="Qwen3-30B-A3B"
+
+# LoRA for RL. Attention-only targets for the same MoE reason as SFT: "all-linear" would
+# adapt all 128 experts per layer. The bracket form must stay a list -- a comma-separated
+# string reaches PEFT as a single module name and trains nothing.
+# With rank > 0 SkyRL switches weight sync to LoRA-adapter sync and enables LoRA in vLLM,
+# so lora_sync_path must be readable by both the trainer and the inference engines.
+LORA_RANK=32
+LORA_ALPHA=64
+LORA_TARGETS="[q_proj,k_proj,v_proj,o_proj]"
+
 #-----------------------
 # Training setup
 #-----------------------
@@ -62,13 +76,16 @@ MAX_CONCURRENT_TASKS=8  # simultaneous rollouts against the sandbox
 uv run --isolated --extra fsdp -m examples.train.mcp_atlas.main_mcp_atlas \
   data.train_data="$TRAIN_DATA" \
   data.val_data="$EVAL_DATA" \
-  trainer.policy.model.path=Qwen/Qwen3-8B \
-  generator.inference_engine.served_model_name=Qwen3-8B \
+  trainer.policy.model.path=$MODEL_PATH \
+  generator.inference_engine.served_model_name=$SERVED_MODEL_NAME \
   mcp_atlas_config.dump_root=$DUMP_ROOT \
   mcp_atlas_config.max_concurrent_tasks=$MAX_CONCURRENT_TASKS \
   trainer.export_path=$EXPORTS_DIR \
   trainer.ckpt_path=$CKPTS_DIR \
   trainer.log_path=$LOG_DIR \
+  trainer.policy.model.lora.rank=$LORA_RANK \
+  trainer.policy.model.lora.alpha=$LORA_ALPHA \
+  trainer.policy.model.lora.target_modules="$LORA_TARGETS" \
   trainer.algorithm.advantage_estimator=grpo \
   trainer.algorithm.loss_reduction=token_mean \
   trainer.algorithm.grpo_norm_by_std=false \

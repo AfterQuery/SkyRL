@@ -6,7 +6,7 @@
 # Expects a vLLM server on 127.0.0.1:8000 serving `Qwen3-30B-A3B`, started WITHOUT
 # --tool-call-parser (the agent sends tool_choice="none" and reads <tool_call> from the text).
 
-jobs_dir: ~/harbor_jobs_mcp_atlas
+jobs_dir: /home/ubuntu/harbor_jobs_mcp_atlas
 n_attempts: 1
 
 orchestrator:

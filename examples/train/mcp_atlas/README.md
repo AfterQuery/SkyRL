@@ -209,9 +209,21 @@ demonstration. Rollouts with `status != graded` are always excluded — those ar
 terminating (one hit 1053 tool calls), which carry no answer to learn from.
 
 **Reasoning and the chat template.** GLM's reasoning traces were not saved in the bundle, so
-the stock Qwen3 template injects an empty `<think>\n\n</think>` into *every* assistant turn —
-and those tokens land inside the trained span (`loss_mask=1`), actively teaching the model to
-skip reasoning. `enable_thinking=False` does not suppress it for completed messages.
+the stock Qwen3 template injects an empty `<think>\n\n</think>` into the **final** assistant
+turn of every row — its `loop.last or reasoning_content` branch fires with nothing to put
+inside. Those tokens land in the trained span (`loss_mask=1`), teaching the model to open and
+immediately close its reasoning on exactly the turn that produces the graded answer.
+`enable_thinking=False` does not suppress it; that flag only affects the generation prompt.
+
+Two further stock behaviours matter for RL, both avoided by the same template:
+
+- It **rewrites** think blocks it does keep (`<think>R</think>X` becomes
+  `<think>\nR\n</think>\n\nX`), so re-rendering a rollout yields different tokens than the
+  policy emitted.
+- It **strips** reasoning from assistant turns at or before `last_query_index` — the last
+  *genuine* user message, where a wholly `<tool_response>`-wrapped user message does not
+  count. Pure tool-calling rollouts have one genuine query at index 0, so nothing is stripped
+  there; it bites only when real user turns are interleaved.
 
 The fix is `skyrl/train/utils/templates/qwen3_acc_thinking.jinja2`, which never injects a think
 block and never strips reasoning from earlier turns. Since `SFTConfig` has no `chat_template`

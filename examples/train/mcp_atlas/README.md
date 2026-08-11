@@ -260,5 +260,28 @@ Three requirements that are easy to miss:
    `<tool_call>{...}</tool_call>` from the response text; a server-side parser moves those
    calls out of `content` and the loop sees none.
 3. **The environment image must expose MCP** over sse or streamable-http. Upstream's sandbox
-   serves a REST API (`/list-tools`, `/call-tool`) instead, so `--mcp-url` needs an image
-   that speaks MCP proper. This is the open dependency for the Harbor path.
+   serves a REST API (`/list-tools`, `/call-tool`) instead. `adapters/mcp_atlas/mcp_bridge.py`
+   in the Harbor fork re-exposes that REST API as MCP, which is enough to run locally:
+
+   ```bash
+   uv run --with mcp --with httpx mcp_bridge.py --sandbox http://localhost:1984 --port 1985
+   ```
+
+   Bind it to the interface the agent connects from -- FastMCP rejects mismatched Host
+   headers with HTTP 421.
+
+4. **Environments default to Daytona** (`environment.type` in `harbor_trial_config.yaml`),
+   which gives one cloud sandbox per trial and lets rollouts parallelise beyond this machine.
+   Set `DAYTONA_API_KEY` (or `DAYTONA_JWT_TOKEN` + `DAYTONA_ORGANIZATION_ID`) in
+   `.env.mcp_atlas`. Switch to `type: docker` to run locally.
+
+   **Two things do not survive the move to cloud**, because a Daytona sandbox cannot reach
+   this machine's localhost: the judge in `verifier.env` must be a publicly reachable
+   endpoint, and the MCP endpoint should live inside the task image rather than behind a
+   host-local bridge.
+
+5. **Tool state is shared, not per-task.** Harbor gives each trial its own container, but
+   every task's tool calls still land in the one shared MCP-Atlas sandbox -- same filesystem,
+   memory graph, and response cache. Read-only tasks are unaffected, which is what
+   `--exclude-mutating` is for; genuine isolation needs the MCP server running inside each
+   task's own environment.

@@ -42,12 +42,24 @@ agent:
       top_p: 1.0
 
 environment:
-  # Local Docker rather than Daytona: MCP-Atlas task images are large and the MCP endpoint
-  # is reached over localhost inside the task container.
-  type: docker
+  # Daytona: cloud sandboxes, one per trial, so rollouts parallelise beyond one machine.
+  # Requires DAYTONA_API_KEY (or DAYTONA_JWT_TOKEN + DAYTONA_ORGANIZATION_ID); optionally
+  # DAYTONA_TARGET to pick a region. Set `type: docker` to run locally instead.
+  #
+  # Going cloud moves two services out of reach, because a Daytona sandbox cannot see this
+  # machine's localhost:
+  #   * the judge -- verifier.env below must point at a publicly reachable endpoint, not a
+  #     host-local stub;
+  #   * the MCP endpoint -- the mcp-atlas agent runs host-side so it still reaches a local
+  #     bridge, but the sandbox it proxies to is on this machine. For real isolation the MCP
+  #     server should live inside the task image (see the adapter's --mcp-url).
+  type: daytona
   override_cpus: 4
   override_memory_mb: 8192
   suppress_override_warnings: true
+  kwargs:
+    # Stop an idle sandbox rather than leaving it billing.
+    auto_stop_interval_mins: 30
 
   # Keys for the key-gated MCP servers, forwarded into the task container. `:-` supplies an
   # empty default so a missing key does not fail the trial -- that server just stays

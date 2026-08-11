@@ -32,7 +32,7 @@ set -xeou pipefail
 #     --base Qwen/Qwen3-30B-A3B \
 #     --adapter $CKPT_PATH/global_step_<N>/policy/lora_adapter \
 #     --output $HOME/mcp_atlas_sft_run/merged
-#   bash examples/train/mcp_atlas/run_mcp_atlas.sh \
+#   bash examples/train/mcp_atlas/run_mcp_atlas_harbor.sh \
 #     trainer.policy.model.path=$HOME/mcp_atlas_sft_run/merged
 
 : "${DATA_DIR:="$HOME/data/mcp_atlas_sft"}"

@@ -1,0 +1,50 @@
+# Harbor job config for evaluating a policy on MCP-Atlas tasks.
+#
+#   set -a; . examples/train/mcp_atlas/.env.mcp_atlas.local; set +a
+#   uv run --extra harbor harbor run -p <tasks> --config examples/train/mcp_atlas/harbor_eval_config.yaml
+#
+# Expects a vLLM server on 127.0.0.1:8000 serving `Qwen3-30B-A3B`, started WITHOUT
+# --tool-call-parser (the agent sends tool_choice="none" and reads <tool_call> from the text).
+
+jobs_dir: ~/harbor_jobs_mcp_atlas
+n_attempts: 1
+
+orchestrator:
+  type: local
+  # Each trial runs its own container with Postgres plus the simulated services, and all
+  # trials share one vLLM server, so this trades container memory against GPU queueing.
+  n_concurrent_trials: 4
+
+environment:
+  type: docker
+  force_build: false
+  delete: true
+
+verifier:
+  # The verifier runs inside the container; ${VAR} is resolved from the host at trial start
+  # and re-serialized as a template when persisted, so keys stay out of trial logs.
+  env:
+    EVAL_LLM_BASE_URL: "${EVAL_LLM_BASE_URL}"
+    EVAL_LLM_API_KEY: "${EVAL_LLM_API_KEY}"
+    EVAL_LLM_MODEL: "${EVAL_LLM_MODEL}"
+
+agents:
+  - name: mcp-atlas
+    model_name: hosted_vllm/Qwen3-30B-A3B
+    kwargs:
+      api_base: http://127.0.0.1:8000/v1
+      # Tools come from the container's own API over environment.exec. Harbor replaces the
+      # image CMD with a keepalive, so the agent has to start that API itself.
+      sandbox_url: http://localhost:1984
+      sandbox_start_command: /workspace/runtime_env/docker/run_agent_environment.sh
+      # AQ task.toml sets max_steps = 20; keep the agent's budget in the same range.
+      max_turns: 24
+      max_tool_calls: 20
+      tool_output_cap: 10000
+      # Per-turn token IDs and logprobs, so the same config can feed step-wise RL.
+      collect_rollout_details: true
+      model_info:
+        max_input_tokens: 32768
+        max_output_tokens: 4096
+        input_cost_per_token: 0.0
+        output_cost_per_token: 0.0

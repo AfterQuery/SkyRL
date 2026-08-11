@@ -195,3 +195,54 @@ Settings live in `mcp_atlas_config.yaml`, overridable as `mcp_atlas_config.<key>
   rebuild the image with `mcp` pinned in `mcp_server_template.json` (`--with mcp==<version>`).
 - The sandbox's 48h tool-response cache makes repeated identical tool calls deterministic and
   cheap (usually good for RL); `POST {sandbox}/cache-clear` resets it.
+
+## Alternative runner: Harbor
+
+`run_mcp_atlas.sh` above drives one shared sandbox through `MCPAtlasGenerator`. There is a
+second path that runs the same benchmark through [Harbor](https://github.com/harbor-framework/harbor)
+instead, which buys three things the shared-sandbox path cannot give:
+
+- **Per-task containers with seeded state**, so tasks that mutate their environment don't
+  contaminate each other (the shared sandbox never resets).
+- **Exact per-turn token IDs and logprobs**, so training is step-wise with off-policy
+  correction (TIS) rather than re-tokenizing a finished conversation.
+- **Harbor's verifier**, so reward is produced inside the task container.
+
+It needs no new SkyRL generator — the existing Harbor entrypoint plus a trial config that
+selects the agent is enough:
+
+```bash
+# 1. Generate Harbor bundles (in the harbor checkout)
+cd /path/to/harbor/adapters/mcp_atlas
+uv run run_adapter.py --hf --image <image exposing MCP> \
+  --mcp-url http://localhost:1984/mcp --out $HOME/data/mcp_atlas_harbor/tasks
+
+# 2. Sanity check the bundles
+harbor run -p $HOME/data/mcp_atlas_harbor/tasks -a oracle   # expect reward 1.0
+harbor run -p $HOME/data/mcp_atlas_harbor/tasks -a nop      # expect reward 0.0
+
+# 3. Train
+export EVAL_LLM_BASE_URL=... EVAL_LLM_API_KEY=... EVAL_LLM_MODEL=...
+bash examples/train/mcp_atlas/run_mcp_atlas_harbor.sh
+```
+
+The agent and adapter live in Harbor, not here: `harbor.agents.installed.mcp_atlas` (registered
+as `mcp-atlas`) and `adapters/mcp_atlas/`. `harbor_trial_config.yaml` selects it with
+`agent.name: mcp-atlas`.
+
+Three requirements that are easy to miss:
+
+1. **The `harbor` dependency must contain the agent.** `pyproject.toml` currently pins
+   upstream Harbor, where `mcp-atlas` is an unknown agent name and trials fail at
+   construction. Point it at the fork carrying the agent (`AfterQuery/harbor-aq`, branch
+   `aq`). Note that fork is Harbor 0.18.0 while the pin is 0.13.1, so this also upgrades
+   Harbor for the existing `train_integrations/harbor` examples — re-run
+   `run_codecontest.sh` as a regression check before relying on it.
+2. **Do not enable a server-side tool-call parser.** `run_mcp_atlas_harbor.sh` deliberately
+   omits `enable_auto_tool_choice` / `tool_call_parser`, unlike `run_mcp_atlas.sh`. Harbor's
+   `LLMResponse` has no `tool_calls` field, so the agent parses
+   `<tool_call>{...}</tool_call>` from the response text; a server-side parser moves those
+   calls out of `content` and the loop sees none.
+3. **The environment image must expose MCP** over sse or streamable-http. Upstream's sandbox
+   serves a REST API (`/list-tools`, `/call-tool`) instead, so `--mcp-url` needs an image
+   that speaks MCP proper. This is the open dependency for the Harbor path.

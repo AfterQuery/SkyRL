@@ -1,0 +1,53 @@
+# Harbor TrialConfig for MCP-Atlas RL training.
+#
+# Used with the existing Harbor entrypoint -- no MCP-Atlas-specific generator is needed,
+# because Harbor's per-task container, MCP wiring, and verifier already do that work:
+#
+#   uv run --isolated --extra fsdp --extra harbor \
+#     -m examples.train_integrations.harbor.entrypoints.main_harbor \
+#     harbor_trial_config=examples/train/mcp_atlas/harbor_trial_config.yaml ...
+#
+# SkyRL injects at runtime: task.path, agent.model_name, agent.kwargs.api_base,
+# agent.kwargs.session_id, and agent.kwargs.collect_rollout_details.
+
+trials_dir: ~/trials/mcp_atlas
+
+agent:
+  # Resolves through Harbor's agent factory. Requires the harbor dependency to include
+  # the mcp-atlas agent (AfterQuery/harbor-aq @ aq); on upstream Harbor this name is
+  # unknown and the trial will fail at agent construction.
+  name: mcp-atlas
+  override_timeout_sec: 1800
+
+  kwargs:
+    max_turns: 32
+    max_tool_calls: 50
+    # Match the RL generator's tool_output_cap so a warm-started policy sees the same
+    # observation format it was trained on.
+    tool_output_cap: 10000
+    # Per-turn token IDs and logprobs -> step-wise training with TIS. SkyRL force-enables
+    # this when generator.step_wise_trajectories=true; set here so it is explicit.
+    collect_rollout_details: true
+
+    model_info:
+      # Keep in sync with generator.inference_engine.engine_init_kwargs.max_model_len.
+      max_input_tokens: 32768
+      max_output_tokens: 32768
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+    llm_kwargs:
+      timeout: 900
+      max_retries: 0
+      top_p: 1.0
+
+environment:
+  # Local Docker rather than Daytona: MCP-Atlas task images are large and the MCP endpoint
+  # is reached over localhost inside the task container.
+  type: docker
+  override_cpus: 4
+  override_memory_mb: 8192
+  suppress_override_warnings: true
+
+verifier:
+  disable: false

@@ -74,7 +74,7 @@ LORA_TARGETS="[q_proj,k_proj,v_proj,o_proj]"
 
 # LoRA wants a markedly higher LR than full fine-tuning (only the adapters move).
 # Warmup is short because the whole run is only ~31 steps at batch_size 32.
-LR=1e-5
+LR=3e-5
 WARMUP_STEPS=5
 
 NUM_GPUS=8

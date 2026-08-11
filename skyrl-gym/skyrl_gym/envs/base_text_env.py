@@ -6,12 +6,19 @@ MessageType = Dict[str, str]
 ConversationType = List[MessageType]
 
 
-class BaseTextEnvStepOutput(TypedDict):
+class _BaseTextEnvStepOutputRequired(TypedDict):
     observations: ConversationType  # OpenAI API Messages Format
     reward: float
     done: bool
     metadata: Dict[str, Any]
-    postprocessed_action: Optional[str] = None
+
+
+class BaseTextEnvStepOutput(_BaseTextEnvStepOutputRequired, total=False):
+    # Optional: a default value cannot be set on a TypedDict field (the previous
+    # ``postprocessed_action: Optional[str] = None`` was a no-op that left the
+    # key *required*), so mark it optional via a total=False base instead. This
+    # matches step() implementations that omit it.
+    postprocessed_action: Optional[str]
 
 
 class BaseTextEnv(Env[ConversationType, str]):

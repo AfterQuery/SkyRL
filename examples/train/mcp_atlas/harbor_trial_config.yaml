@@ -49,5 +49,40 @@ environment:
   override_memory_mb: 8192
   suppress_override_warnings: true
 
+  # Keys for the key-gated MCP servers, forwarded into the task container. `:-` supplies an
+  # empty default so a missing key does not fail the trial -- that server just stays
+  # disabled, and only tasks needing it fail. Populate via
+  # examples/train/mcp_atlas/.env.mcp_atlas (or .env.mcp_atlas.local for real secrets).
+  env:
+    AIRTABLE_API_KEY: "${AIRTABLE_API_KEY:-}"
+    ALCHEMY_API_KEY: "${ALCHEMY_API_KEY:-}"
+    BRAVE_API_KEY: "${BRAVE_API_KEY:-}"
+    E2B_API_KEY: "${E2B_API_KEY:-}"
+    EXA_API_KEY: "${EXA_API_KEY:-}"
+    GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+    GOOGLE_MAPS_API_KEY: "${GOOGLE_MAPS_API_KEY:-}"
+    GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID:-}"
+    GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET:-}"
+    GOOGLE_REFRESH_TOKEN: "${GOOGLE_REFRESH_TOKEN:-}"
+    LARA_ACCESS_KEY_ID: "${LARA_ACCESS_KEY_ID:-}"
+    LARA_ACCESS_KEY_SECRET: "${LARA_ACCESS_KEY_SECRET:-}"
+    MONGODB_CONNECTION_STRING: "${MONGODB_CONNECTION_STRING:-}"
+    NOTION_TOKEN: "${NOTION_TOKEN:-}"
+    NPS_API_KEY: "${NPS_API_KEY:-}"
+    OXYLABS_USERNAME: "${OXYLABS_USERNAME:-}"
+    OXYLABS_PASSWORD: "${OXYLABS_PASSWORD:-}"
+    SLACK_MCP_XOXC_TOKEN: "${SLACK_MCP_XOXC_TOKEN:-}"
+    SLACK_MCP_XOXD_TOKEN: "${SLACK_MCP_XOXD_TOKEN:-}"
+    WEATHER_API_KEY: "${WEATHER_API_KEY:-}"
+
 verifier:
   disable: false
+
+  # The verifier runs INSIDE the task container and needs the judge to score claims.
+  # ${VAR} is resolved from the host env at trial start (harbor.utils.env.resolve_env_vars)
+  # and stays a template when the config is persisted, so keys never land in trial logs.
+  env:
+    EVAL_LLM_BASE_URL: "${EVAL_LLM_BASE_URL}"
+    EVAL_LLM_API_KEY: "${EVAL_LLM_API_KEY}"
+    EVAL_LLM_MODEL: "${EVAL_LLM_MODEL}"
+

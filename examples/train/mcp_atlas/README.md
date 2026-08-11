@@ -49,10 +49,26 @@ repetitions of the same task, but for mutating tasks you should prepare the data
    With no API keys, 20 of 36 servers run (arxiv, calculator, fetch, filesystem, git,
    wikipedia, ddg-search, ...). Keys in `.env` enable more (github, brave-search, notion, ...).
 
-2. **A judge endpoint** — the reward source. Set `EVAL_LLM_BASE_URL` / `EVAL_LLM_API_KEY` /
-   `EVAL_LLM_MODEL` (or `mcp_atlas_config.judge.*`) to a real LLM API (the official default
-   judge is `gemini/gemini-3.1-pro-preview` via LiteLLM). It must never point at the policy
-   being trained.
+2. **API keys**, declared in `.env.mcp_atlas` and loaded automatically by both run scripts
+   (override the path with `ENV_FILE=...`):
+
+   - **Judge — required.** `EVAL_LLM_BASE_URL` / `EVAL_LLM_API_KEY` / `EVAL_LLM_MODEL`. This
+     *is* the reward signal, so nothing trains without it, and it must never point at the
+     policy being trained. The upstream default judge is `gemini/gemini-3.1-pro-preview`.
+   - **MCP server keys — optional**, one group per key-gated server (`GITHUB_TOKEN`,
+     `NOTION_TOKEN`, `BRAVE_API_KEY`, `AIRTABLE_API_KEY`, …). Only 35 of the 500 upstream
+     tasks need no keys at all, so these decide how much of the benchmark is reachable. A
+     server whose keys are absent is simply not enabled; only tasks needing it fail.
+
+   `.env.mcp_atlas` is **committed and holds placeholders only**. Put real secrets in
+   `.env.mcp_atlas.local` (gitignored) and run with
+   `ENV_FILE=examples/train/mcp_atlas/.env.mcp_atlas.local`, or export them in your shell.
+
+   On the Harbor path the keys reach the task container through
+   `harbor_trial_config.yaml`, which references them as `${VAR}` templates. Harbor resolves
+   those from the host at trial start and re-serializes sensitive values back to `${VAR}`
+   when persisting the config, so keys stay out of trial logs. Optional keys use
+   `${VAR:-}` so a missing one leaves that server disabled instead of failing the trial.
 
 3. vLLM tool-call parsing for the policy: `engine_init_kwargs.enable_auto_tool_choice=true`
    and the matching `tool_call_parser` (e.g. `hermes` for Qwen), as in `run_mcp_atlas.sh`.

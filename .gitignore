@@ -126,3 +126,6 @@ tx/tinker/alembic/__pycache__/
 
 # claude settings
 .claude/settings.json
+
+# Local MCP-Atlas secrets (never commit real keys)
+examples/train/mcp_atlas/.env.mcp_atlas.local

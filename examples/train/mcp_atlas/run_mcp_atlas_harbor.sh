@@ -1,5 +1,10 @@
 set -ex
 
+# API keys: the judge (required -- it produces the reward) and the key-gated MCP servers.
+# Real secrets belong in .env.mcp_atlas.local (gitignored); the committed .env.mcp_atlas
+# holds placeholders only. Override with ENV_FILE=... to point elsewhere.
+: "${ENV_FILE:=$(dirname "$0")/.env.mcp_atlas}"
+
 # GRPO on MCP-Atlas via Harbor, reusing the existing Harbor entrypoint.
 #
 # Why this exists alongside run_mcp_atlas.sh: Harbor gives per-task container isolation,
@@ -41,7 +46,7 @@ TP_SIZE=2
 # parses <tool_call>{...}</tool_call> out of the response text, because Harbor's LLMResponse
 # has no tool_calls field. Enabling a server-side parser moves the calls out of `content`
 # and the agent's loop sees no tool calls at all.
-uv run --isolated --extra fsdp --extra harbor \
+uv run --isolated --extra fsdp --extra harbor --env-file "$ENV_FILE" \
   -m examples.train_integrations.harbor.entrypoints.main_harbor \
   data.train_data="$TRAIN_DATA" \
   trainer.policy.model.path=Qwen/Qwen3-8B \

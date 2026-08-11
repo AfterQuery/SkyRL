@@ -1,5 +1,10 @@
 set -ex
 
+# API keys: the judge (required -- it produces the reward) and the key-gated MCP servers.
+# Real secrets belong in .env.mcp_atlas.local (gitignored); the committed .env.mcp_atlas
+# holds placeholders only. Override with ENV_FILE=... to point elsewhere.
+: "${ENV_FILE:=$(dirname "$0")/.env.mcp_atlas}"
+
 # GRPO training on MCP-Atlas tasks against a local sandbox.
 #
 # Prerequisites (see README.md):
@@ -73,7 +78,7 @@ NUM_INFERENCE_ENGINES=4
 TP_SIZE=2
 MAX_CONCURRENT_TASKS=8  # simultaneous rollouts against the sandbox
 
-uv run --isolated --extra fsdp -m examples.train.mcp_atlas.main_mcp_atlas \
+uv run --isolated --extra fsdp --env-file "$ENV_FILE" -m examples.train.mcp_atlas.main_mcp_atlas \
   data.train_data="$TRAIN_DATA" \
   data.val_data="$EVAL_DATA" \
   trainer.policy.model.path=$MODEL_PATH \

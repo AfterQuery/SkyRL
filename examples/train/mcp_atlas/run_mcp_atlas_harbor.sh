@@ -43,9 +43,12 @@ NUM_INFERENCE_ENGINES=4
 TP_SIZE=2
 
 # NOTE: deliberately NO enable_auto_tool_choice / tool_call_parser here. The mcp-atlas agent
-# parses <tool_call>{...}</tool_call> out of the response text, because Harbor's LLMResponse
-# has no tool_calls field. Enabling a server-side parser moves the calls out of `content`
-# and the agent's loop sees no tool calls at all.
+# sends tool_choice="none" and reads <tool_call>{...}</tool_call> from the response text,
+# because Harbor's LLMResponse has no tool_calls field. vLLM rejects tools= under the default
+# "auto" unless those flags are set, and setting them makes its parser strip the calls out of
+# `content`. tool_choice="none" still renders every schema into the prompt (Qwen templates
+# ignore tool_choice), so the model emits the same tokens either way -- the parser is a regex
+# over the completion, not a change in model behaviour.
 uv run --isolated --extra fsdp --extra harbor --env-file "$ENV_FILE" \
   -m examples.train_integrations.harbor.entrypoints.main_harbor \
   data.train_data="$TRAIN_DATA" \

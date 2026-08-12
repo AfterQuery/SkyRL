@@ -55,6 +55,11 @@ class HarborTrajectoryOutput:
     # End-to-end wall-clock time (seconds) to generate this trajectory. Optional: left as None if
     # timing was not recorded.
     e2e_time: Optional[float] = None
+    # Agent-reported detail, when the agent puts it in agent_result.metadata. Optional because
+    # not every agent does (terminus-2 reports only n_episodes), so metrics below are emitted
+    # only for the trajectories that carry them.
+    n_tool_calls: Optional[int] = None
+    agent_stop_reason: Optional[str] = None
 
 
 def build_step_wise_generator_output(
@@ -193,6 +198,26 @@ def build_step_wise_generator_output(
         rollout_metrics["generate/avg_num_turns"] = sum(t.num_turns for t in successful_trajectories) / len(
             successful_trajectories
         )
+        # Tool-use metrics, for agents that report them in agent_result.metadata. Turn count
+        # alone cannot separate "solved it in one turn" from "never called a tool" -- and the
+        # latter is the dominant failure of an untrained policy on tool-use benchmarks
+        # (measured: 14 of 20 trajectories made zero tool calls before any training).
+        with_tool_counts = [t for t in successful_trajectories if t.n_tool_calls is not None]
+        if with_tool_counts:
+            rollout_metrics["generate/avg_num_tool_calls"] = sum(
+                t.n_tool_calls for t in with_tool_counts
+            ) / len(with_tool_counts)
+            rollout_metrics["generate/frac_zero_tool_call_trajectories"] = sum(
+                1 for t in with_tool_counts if t.n_tool_calls == 0
+            ) / len(with_tool_counts)
+        # How rollouts ended, as reported by the agent itself: a rollout that ran out of steps
+        # or was truncated is a different problem from one that chose to stop.
+        agent_stops = [t.agent_stop_reason for t in successful_trajectories if t.agent_stop_reason]
+        if agent_stops:
+            for reason in sorted(set(agent_stops)):
+                rollout_metrics[f"generate/agent_stop_reason/{reason}"] = sum(
+                    1 for r in agent_stops if r == reason
+                ) / len(agent_stops)
     else:
         rollout_metrics = {}
 
@@ -356,6 +381,8 @@ class HarborGenerator(GeneratorInterface):
         results = None
         rollout_details = None
         num_turns = None
+        n_tool_calls = None
+        agent_stop_reason = None
         successful = False
         is_context_length_error = False
         is_agent_timeout_error = False
@@ -408,7 +435,10 @@ class HarborGenerator(GeneratorInterface):
 
                 # Extract rollout details and check for success
                 rollout_details = results.agent_result.rollout_details
-                num_turns = results.agent_result.metadata["n_episodes"]
+                metadata = results.agent_result.metadata
+                num_turns = metadata["n_episodes"]
+                n_tool_calls = metadata.get("n_tool_calls")
+                agent_stop_reason = metadata.get("stop_reason")
 
                 if (
                     rollout_details
@@ -446,4 +476,6 @@ class HarborGenerator(GeneratorInterface):
                 num_turns=num_turns,
                 stop_reason="context_length" if is_context_length_error else "complete",
                 e2e_time=time.monotonic() - agent_loop_start_time,
+                n_tool_calls=n_tool_calls,
+                agent_stop_reason=agent_stop_reason,
             )

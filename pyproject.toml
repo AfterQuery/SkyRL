@@ -306,7 +306,12 @@ vllm = [
 # treats 2.8.3+local > 2.8.3, so TE's get_attention_backend (max_version=
 # "2.8.3") rejected it and silently fell back to broken unfused attention.
 flash-attn = { url = "https://github.com/erictang000/flash-attention/releases/download/v2.8.3-torch2.11-clean/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
-causal-conv1d = { url = "https://github.com/erictang000/causal-conv1d/releases/download/v1.6.1.post4-torch2.11/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
+# Local wheel rather than the GitHub release URL. Every Ray worker builds its own
+# `uv run --isolated` environment, so a launch fires a burst of concurrent requests at
+# the same release asset; GitHub answers some with HTTP/2 "refused stream" and 503, and
+# uv then fails to generate package metadata, which kills that worker at startup.
+# Fetch once with: curl -fsSL -o ~/wheels/<name>.whl <the release URL above>
+causal-conv1d = { path = "/home/ubuntu/wheels/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
 mamba-ssm = { url = "https://github.com/erictang000/mamba/releases/download/v2.3.1-torch2.11/mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
 # transformer-engine-torch 2.11.0 built against torch 2.11 (cu128 / cp312).
 transformer-engine-torch = { url = "https://github.com/erictang000/TransformerEngine/releases/download/v2.11.0-torch2.11/transformer_engine_torch-2.11.0-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }

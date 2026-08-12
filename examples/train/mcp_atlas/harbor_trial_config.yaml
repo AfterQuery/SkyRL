@@ -1,70 +1,65 @@
 # Harbor TrialConfig for MCP-Atlas RL training.
 #
-# Used with the existing Harbor entrypoint -- no MCP-Atlas-specific generator is needed,
-# because Harbor's per-task container, MCP wiring, and verifier already do that work:
-#
 #   uv run --isolated --extra fsdp --extra harbor \
 #     -m examples.train_integrations.harbor.entrypoints.main_harbor \
 #     harbor_trial_config=examples/train/mcp_atlas/harbor_trial_config.yaml ...
 #
 # SkyRL injects at runtime: task.path, agent.model_name, agent.kwargs.api_base,
-# agent.kwargs.session_id, and agent.kwargs.collect_rollout_details.
+# agent.kwargs.session_id, agent.kwargs.llm_kwargs.extra_body.cache_salt, and
+# agent.kwargs.collect_rollout_details (force-enabled when step_wise_trajectories=true).
 
 trials_dir: ~/trials/mcp_atlas
 
 agent:
   # Resolves through Harbor's agent factory. Requires the harbor dependency to include
   # the mcp-atlas agent (AfterQuery/harbor-aq @ aq); on upstream Harbor this name is
-  # unknown and the trial will fail at agent construction.
+  # unknown and the trial fails at agent construction.
   name: mcp-atlas
   override_timeout_sec: 1800
 
   kwargs:
-    max_turns: 32
-    max_tool_calls: 50
-    # Match the RL generator's tool_output_cap so a warm-started policy sees the same
-    # observation format it was trained on.
-    tool_output_cap: 10000
-    # Per-turn token IDs and logprobs -> step-wise training with TIS. SkyRL force-enables
-    # this when generator.step_wise_trajectories=true; set here so it is explicit.
+    # vLLM ignores the key, but the in-container runner refuses to start without one.
+    api_key: "${MCP_ATLAS_API_KEY:-local}"
+
+    # Per-turn prompt/completion token IDs and logprobs -> step-wise training with TIS.
+    # The runner gets them from the endpoint directly (logprobs + vLLM's
+    # return_token_ids), since the loop runs in-container and never touches Harbor's LLM
+    # layer. SkyRL force-enables this for step-wise; set here so it is explicit.
     collect_rollout_details: true
 
-    model_info:
-      # Keep in sync with generator.inference_engine.engine_init_kwargs.max_model_len.
-      max_input_tokens: 32768
-      max_output_tokens: 32768
-      input_cost_per_token: 0.0
-      output_cost_per_token: 0.0
+    # Eval leaves these uncapped to match upstream. Training does not: every turn re-sends
+    # the whole history plus all tool output, so uncapped output walks the prompt into
+    # --max-model-len, the endpoint returns HTTP 400, and the trajectory is masked out
+    # instead of contributing gradient. AQ task.toml sets max_steps = 20.
+    max_steps: 20
+    tool_output_cap: 4000
+    max_tokens: 4096
 
+    # Sampling. These reach the chat-completions body, so the collected logprobs describe
+    # the distribution the rollout was actually drawn from -- which is what off-policy
+    # correction assumes.
+    temperature: 1.0
     llm_kwargs:
       timeout: 900
       max_retries: 0
       top_p: 1.0
 
 environment:
-  # Daytona: cloud sandboxes, one per trial, so rollouts parallelise beyond one machine.
-  # Requires DAYTONA_API_KEY (or DAYTONA_JWT_TOKEN + DAYTONA_ORGANIZATION_ID); optionally
-  # DAYTONA_TARGET to pick a region. Set `type: docker` to run locally instead.
-  #
-  # Going cloud moves two services out of reach, because a Daytona sandbox cannot see this
-  # machine's localhost:
-  #   * the judge -- verifier.env below must point at a publicly reachable endpoint, not a
-  #     host-local stub;
-  #   * the MCP endpoint -- the mcp-atlas agent runs host-side so it still reaches a local
-  #     bridge, but the sandbox it proxies to is on this machine. For real isolation the MCP
-  #     server should live inside the task image (see the adapter's --mcp-url).
-  type: daytona
+  # Docker, not Daytona: task Dockerfiles say `FROM mcp-atlas-runtime:<tag>` with no
+  # registry, so the tag only resolves on a host that has pulled and re-tagged it. A remote
+  # builder has no such image. Switching to Daytona needs the runtime pushed to a registry
+  # and the task FROM lines made fully qualified.
+  type: docker
+  force_build: false
+  delete: true
   override_cpus: 4
   override_memory_mb: 8192
   suppress_override_warnings: true
-  kwargs:
-    # Stop an idle sandbox rather than leaving it billing.
-    auto_stop_interval_mins: 30
 
   # Keys for the key-gated MCP servers, forwarded into the task container. `:-` supplies an
   # empty default so a missing key does not fail the trial -- that server just stays
-  # disabled, and only tasks needing it fail. Populate via
-  # examples/train/mcp_atlas/.env.mcp_atlas (or .env.mcp_atlas.local for real secrets).
+  # disabled, and only tasks needing it fail. Mostly irrelevant for AQ-1000, whose services
+  # are simulated inside the image. Populate via .env.mcp_atlas.local.
   env:
     AIRTABLE_API_KEY: "${AIRTABLE_API_KEY:-}"
     ALCHEMY_API_KEY: "${ALCHEMY_API_KEY:-}"
@@ -90,11 +85,10 @@ environment:
 verifier:
   disable: false
 
-  # The verifier runs INSIDE the task container and needs the judge to score claims.
+  # tests/grade.py runs INSIDE the task container and needs the judge to score claims.
   # ${VAR} is resolved from the host env at trial start (harbor.utils.env.resolve_env_vars)
   # and stays a template when the config is persisted, so keys never land in trial logs.
   env:
-    EVAL_LLM_BASE_URL: "${EVAL_LLM_BASE_URL}"
-    EVAL_LLM_API_KEY: "${EVAL_LLM_API_KEY}"
-    EVAL_LLM_MODEL: "${EVAL_LLM_MODEL}"
-
+    MCP_ATLAS_JUDGE_KEY: "${MCP_ATLAS_JUDGE_KEY}"
+    MCP_ATLAS_JUDGE_BASE_URL: "${MCP_ATLAS_JUDGE_BASE_URL}"
+    MCP_ATLAS_JUDGE_MODEL: "${MCP_ATLAS_JUDGE_MODEL}"

@@ -34,9 +34,9 @@ agent:
     # truncating tool results older than the last two turns to 1500 chars). Not usable
     # here: it rewrites earlier turns, and step-wise RL needs each turn's prompt to remain
     # a prefix-extension of the previous one.
-    max_steps: 20
+    max_steps: 80
     tool_output_cap: 4000
-    max_tokens: 4096
+    max_tokens: 8192
 
     # The context cap. Keep in sync with
     # generator.inference_engine.engine_init_kwargs.max_model_len; the loop stops with
@@ -47,9 +47,18 @@ agent:
     # than masking it as a generic failure.
     max_context_tokens: 32768
 
+    # Wall-clock bound on the agent loop, set explicitly because Harbor cannot supply it:
+    # trial.py's _init_agent passes agent_timeout_sec only to the oracle agent, so the
+    # deadline this would otherwise derive never arms. Without it a degenerate rollout runs
+    # until Harbor's asyncio timeout kills the exec -- and that kill happens before the
+    # trajectory is downloaded, which is why such trials came back with stop_reason unset
+    # and no usable rollout data. Keep it under agent.override_timeout_sec (1800) so the
+    # loop stops itself and the trajectory still gets collected.
+    deadline_sec: 1500
+
     model_info:
       max_input_tokens: 32768
-      max_output_tokens: 4096
+      max_output_tokens: 8192
       input_cost_per_token: 0.0
       output_cost_per_token: 0.0
 
@@ -59,7 +68,7 @@ agent:
     temperature: 1.0
     llm_kwargs:
       timeout: 900
-      max_retries: 0
+      max_retries: 1
       top_p: 1.0
 
 environment:

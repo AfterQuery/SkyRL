@@ -53,14 +53,22 @@ TRIAL_CONFIG="$(dirname "$0")/harbor_trial_config.yaml"
 #-----------------------
 # Training setup
 #-----------------------
-# The SFT warm start, not the base model: an untrained Qwen3-30B-A3B scores 0.160 on the
-# 20-task eval and makes no tool calls at all on 14 of 20, so GRPO would see almost no
-# reward variance to learn from. Point at the base model to measure a cold start.
-: "${MODEL_PATH:=$HOME/mcp_atlas_sft_run/merged}"
+# The original model, trained from scratch with RL -- no SFT warm start.
+#
+# Worth knowing what this costs. Measured on the 20-task eval, untrained Qwen3-30B-A3B
+# scores 0.160 coverage and makes zero tool calls on 14 of 20 tasks, answering from
+# parametric knowledge instead. GRPO needs reward variance *within* a group of
+# n_samples_per_prompt rollouts, so prompts where all 8 samples score 0 contribute no
+# gradient. Expect generate/frac_zero_tool_call_trajectories to start near 0.7 and a
+# large fraction of early groups to be flat.
+#
+# Set MODEL_PATH=$HOME/mcp_atlas_sft_run/merged to start from the SFT checkpoint instead
+# (that policy reached 22% zero-tool-call, i.e. it already calls tools).
+: "${MODEL_PATH:=Qwen/Qwen3-30B-A3B}"
 SERVED_MODEL_NAME="Qwen3-30B-A3B"
 
 N_SAMPLES_PER_PROMPT=8
-MINI_BATCH_SIZE=8
+MINI_BATCH_SIZE=32
 MAX_MODEL_LEN=32768
 
 # Algorithmic parameters

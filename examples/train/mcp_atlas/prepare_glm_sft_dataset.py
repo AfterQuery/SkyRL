@@ -52,7 +52,7 @@ import collections
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 _JSON_TYPE = {
     str: "string",
@@ -165,10 +165,33 @@ def convert_messages(
     return out, dangling
 
 
-def build_tool_schemas(enabled_tools: List[str], observed_args: Dict[str, Dict[str, str]]) -> List[Dict[str, Any]]:
-    """Build OpenAI function schemas for a task's enabled tools from observed argument usage."""
+def build_tool_schemas(
+    enabled_tools: List[str],
+    real_schemas: Dict[str, Dict[str, Any]],
+    observed_args: Dict[str, Dict[str, str]],
+    fallback_used: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """OpenAI function schemas for a task's enabled tools, real ones wherever available.
+
+    The schema block is roughly a third of the prompt, and RL serves whatever the container
+    gateway reports, so a reconstructed stub here is a large train/serve mismatch. It is also
+    a mismatch with the teacher: GLM ran through the same runner against the same gateway, so
+    its choices were conditioned on the real descriptions and on ``required`` / ``default``.
+    Measured consequence of getting this wrong: reasoning transferred from SFT (3% -> 100% of
+    turns) while tool-calling did not (70% -> 68% of rollouts made no call at all).
+
+    ``observed_args`` remains only as a fallback for a tool with no served schema, so a gap in
+    the dump degrades one tool rather than failing the run; fallbacks are counted by the
+    caller so they cannot pass unnoticed.
+    """
     schemas = []
     for name in enabled_tools:
+        real = real_schemas.get(name)
+        if real is not None:
+            schemas.append(real)
+            continue
+        if fallback_used is not None:
+            fallback_used.add(name)
         props = {k: {"type": t} for k, t in sorted(observed_args.get(name, {}).items())}
         schemas.append(
             {
@@ -266,6 +289,15 @@ def main() -> None:
         help="Prefix each assistant turn with the teacher's <think> block (default). The "
         "earlier bundle shipped no reasoning, and a model trained on it produced a think "
         "block on only 3%% of turns; this bundle has it, matched by recorded step.",
+    )
+    parser.add_argument(
+        "--tool-schemas",
+        type=Path,
+        default=Path("~/data/mcp_atlas_tool_schemas.json"),
+        help="JSON of real tool schemas from dump_tool_schemas.py. These are what RL serves "
+        "and what the teacher saw, so training on reconstructed stubs instead is a "
+        "train/serve mismatch across a third of the prompt. Pass '' to fall back to schemas "
+        "reconstructed from teacher usage (not recommended).",
     )
     parser.add_argument(
         "--max-length",
@@ -400,6 +432,23 @@ def main() -> None:
     if unusable:
         print(f"  rejected: {dict(unusable.most_common())}")
 
+    real_schemas: Dict[str, Dict[str, Any]] = {}
+    if args.tool_schemas and str(args.tool_schemas):
+        schema_path = Path(str(args.tool_schemas)).expanduser()
+        if not schema_path.is_file():
+            raise SystemExit(
+                f"{schema_path} not found. Generate it with:\n"
+                f"  uv run examples/train/mcp_atlas/dump_tool_schemas.py "
+                f"--tasks-dir <tasks> --output {schema_path}\n"
+                "Or pass --tool-schemas '' to reconstruct from teacher usage instead."
+            )
+        payload = json.loads(schema_path.read_text())
+        real_schemas = payload.get("schemas") or {}
+        print(f"Loaded {len(real_schemas)} real tool schemas from {schema_path} (image {payload.get('image')})")
+    else:
+        print("WARNING: no --tool-schemas; schemas will be reconstructed from teacher usage "
+              "and will not match what RL serves")
+
     # 2. Load each task's enabled_tools (includes distractors the teacher had to reject).
     enabled_by_task: Dict[str, List[str]] = {}
     for task_id in {t for t, _, _, _, _ in selected}:
@@ -450,18 +499,26 @@ def main() -> None:
 
     # 4. Pass two: attach per-task tool schemas and emit rows.
     out_rows = []
+    fallback_used: Set[str] = set()
     for task_id, run, coverage, messages in converted:
         enabled = enabled_by_task.get(task_id, [])
         out_rows.append(
             {
                 "messages": messages,
-                "tools": json.dumps(build_tool_schemas(enabled, observed_args)),
+                "tools": json.dumps(
+                    build_tool_schemas(enabled, real_schemas, observed_args, fallback_used)
+                ),
                 "task_id": task_id,
                 "run_index": run,
                 "coverage": coverage,
             }
         )
 
+    if fallback_used:
+        print(
+            f"WARNING: {len(fallback_used)} tools had no served schema and fell back to "
+            f"reconstruction: {sorted(fallback_used)[:8]}"
+        )
     rng = random.Random(args.seed)
     rng.shuffle(out_rows)
 

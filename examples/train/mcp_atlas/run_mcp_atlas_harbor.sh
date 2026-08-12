@@ -67,7 +67,19 @@ MINI_BATCH_SIZE=8
 MAX_MODEL_LEN=32768
 
 # Algorithmic parameters
-LOSS_REDUCTION="token_mean"  # with step-wise training, we have to use token_mean to be prefix-merge-invariant
+# sequence_mean, not run_codecontest.sh's token_mean: per-sequence average token loss, then
+# averaged over the batch. With merge_stepwise_output=true a trajectory collapses to one
+# sequence, so every task contributes equally regardless of how many turns it took. Under
+# token_mean a rambling 20-turn rollout would dominate the gradient over a crisp 2-turn one
+# purely by token count.
+#
+# The trade-off token_mean avoids: sequence_mean is NOT prefix-merge-invariant. Merging is
+# greedy and flushes whenever prompt[i]+response[i] stops being a prefix of prompt[i+1], and
+# each extra group is another sequence in the average -- so a trajectory that fails to merge
+# silently gains weight. That prefix property is verified to hold here, and it is a further
+# reason enable_summarize and upstream's context compaction stay off: both rewrite earlier
+# turns and would break it.
+LOSS_REDUCTION="sequence_mean"
 GRPO_NORM_BY_STD=false
 USE_KL_LOSS=false
 APPLY_OVERLONG_FILTERING=true

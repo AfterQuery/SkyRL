@@ -198,7 +198,7 @@ Merge before RL, or RL silently starts from base weights:
 ```bash
 uv run examples/train/mcp_atlas/merge_lora_adapter.py \
   --base Qwen/Qwen3-30B-A3B \
-  --adapter $HOME/mcp_atlas_sft_run/ckpts/global_step_32/policy/lora_adapter \
+  --adapter $HOME/mcp_atlas_sft_run/ckpts/global_step_<N>/policy/lora_adapter \
   --output $HOME/mcp_atlas_sft_run/merged
 ```
 

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from pathlib import Path
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Optional
@@ -60,6 +61,10 @@ class HarborTrajectoryOutput:
     # only for the trajectories that carry them.
     n_tool_calls: Optional[int] = None
     agent_stop_reason: Optional[str] = None
+    # Target-tool recall, and the raw verifier coverage before any shaping. Both kept so the
+    # unshaped number stays reportable and comparable to the benchmark.
+    tool_recall: Optional[float] = None
+    raw_reward: Optional[float] = None
 
 
 def build_step_wise_generator_output(
@@ -212,6 +217,21 @@ def build_step_wise_generator_output(
             ) / len(with_tool_counts)
         # How rollouts ended, as reported by the agent itself: a rollout that ran out of steps
         # or was truncated is a different problem from one that chose to stop.
+        with_recall = [t for t in successful_trajectories if t.tool_recall is not None]
+        if with_recall:
+            rollout_metrics["generate/target_tool_recall"] = sum(
+                t.tool_recall for t in with_recall
+            ) / len(with_recall)
+            rollout_metrics["generate/frac_all_target_tools_called"] = sum(
+                1 for t in with_recall if t.tool_recall >= 1.0
+            ) / len(with_recall)
+        # The unshaped verifier score, kept alongside the shaped one: it is the number that is
+        # comparable to the benchmark, and the gap between the two is how much shaping moved.
+        with_raw = [t for t in successful_trajectories if t.raw_reward is not None]
+        if with_raw:
+            rollout_metrics["generate/coverage_unshaped"] = sum(
+                t.raw_reward for t in with_raw
+            ) / len(with_raw)
         agent_stops = [t.agent_stop_reason for t in successful_trajectories if t.agent_stop_reason]
         if agent_stops:
             for reason in sorted(set(agent_stops)):
@@ -383,6 +403,8 @@ class HarborGenerator(GeneratorInterface):
         num_turns = None
         n_tool_calls = None
         agent_stop_reason = None
+        tool_recall = None
+        raw_reward = None
         successful = False
         is_context_length_error = False
         is_agent_timeout_error = False
@@ -431,7 +453,13 @@ class HarborGenerator(GeneratorInterface):
                     logger.warning(f"{prefix} failed: Exception info: {results.exception_info}. Results: {results}")
                     continue
                 else:
-                    reward = float(results.verifier_result.rewards["reward"])
+                    rewards = results.verifier_result.rewards
+                    reward = float(rewards["reward"])
+                    # Reported by the verifier, not computed here: the reward and its
+                    # components are the benchmark's to define, and the trainer only reads
+                    # them. These two are for logging.
+                    tool_recall = rewards.get("target_tool_recall")
+                    raw_reward = rewards.get("coverage")
 
                 # Extract rollout details and check for success
                 rollout_details = results.agent_result.rollout_details
@@ -439,6 +467,7 @@ class HarborGenerator(GeneratorInterface):
                 num_turns = metadata["n_episodes"]
                 n_tool_calls = metadata.get("n_tool_calls")
                 agent_stop_reason = metadata.get("stop_reason")
+
 
                 if (
                     rollout_details
@@ -478,4 +507,6 @@ class HarborGenerator(GeneratorInterface):
                 e2e_time=time.monotonic() - agent_loop_start_time,
                 n_tool_calls=n_tool_calls,
                 agent_stop_reason=agent_stop_reason,
+                tool_recall=tool_recall,
+                raw_reward=raw_reward,
             )

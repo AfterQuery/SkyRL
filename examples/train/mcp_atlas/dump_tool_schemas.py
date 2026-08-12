@@ -112,6 +112,15 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--image", default="mcp-atlas-runtime:delivery7-20260625")
     parser.add_argument("--boot-timeout", type=int, default=300)
+    parser.add_argument(
+        "--emit-target-tools",
+        type=Path,
+        default=None,
+        help="Also write tests/target_tools.json into each task under this directory, copied "
+        "from its task.toml. The verifier needs it to score tool recall, and only tests/ is "
+        "uploaded into the container -- task.toml is not. Point this at the patched copy of "
+        "the task set, alongside the grade.py swap.",
+    )
     args = parser.parse_args()
 
     per_task = enabled_services(args.tasks_dir.expanduser())
@@ -142,6 +151,27 @@ def main() -> None:
     print(f"  tools declared by tasks: {len(declared)}; without a served schema: {len(missing)}")
     if missing:
         print(f"    e.g. {missing[:5]}")
+
+    if args.emit_target_tools:
+        root = args.emit_target_tools.expanduser()
+        written = skipped = 0
+        for toml_path in sorted(glob.glob(str(root / "*" / "task.toml"))):
+            text = Path(toml_path).read_text()
+            start = text.find("target_tools = [")
+            if start == -1:
+                skipped += 1
+                continue
+            body = text[start + len("target_tools = [") : text.find("]", start)]
+            tools = [p.strip().strip('",').strip('"') for p in body.split("\n") if p.strip(" ,")]
+            tests = Path(toml_path).parent / "tests"
+            if not tests.is_dir():
+                skipped += 1
+                continue
+            (tests / "target_tools.json").write_text(
+                json.dumps({"target_tools": [t for t in tools if t]}, indent=1) + "\n"
+            )
+            written += 1
+        print(f"  wrote tests/target_tools.json for {written} tasks ({skipped} skipped)")
 
     payload = {
         "image": args.image,

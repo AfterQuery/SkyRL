@@ -117,3 +117,15 @@ verifier:
     MCP_ATLAS_JUDGE_KEY: "${MCP_ATLAS_JUDGE_KEY}"
     MCP_ATLAS_JUDGE_BASE_URL: "${MCP_ATLAS_JUDGE_BASE_URL}"
     MCP_ATLAS_JUDGE_MODEL: "${MCP_ATLAS_JUDGE_MODEL}"
+
+    # Tool-use shaping, computed by the verifier: reward = coverage * (1 - w + w * recall)
+    # against the task's declared target_tools. The judge sees only the final answer text, so
+    # it cannot tell an answer derived from the right tools from one recalled after the same
+    # task has been rolled out dozens of times (n_samples_per_prompt 8 x 3 epochs = 24).
+    #
+    # Multiplicative, so a wrong answer stays worthless however many tools were called and the
+    # term cannot be farmed independently of solving the task. Requires the task set to ship
+    # tests/target_tools.json; without it recall is undefined and the reward is plain coverage.
+    # reward.json also reports coverage and target_tool_recall separately, so the unshaped
+    # score stays comparable to the benchmark. Set 0 to disable.
+    MCP_ATLAS_TOOL_REWARD_WEIGHT: "0.3"

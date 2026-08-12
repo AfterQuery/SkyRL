@@ -64,7 +64,7 @@ TRIAL_CONFIG="$(dirname "$0")/harbor_trial_config.yaml"
 #
 # Set MODEL_PATH=$HOME/mcp_atlas_sft_run/merged to start from the SFT checkpoint instead
 # (that policy reached 22% zero-tool-call, i.e. it already calls tools).
-: "${MODEL_PATH:=Qwen/Qwen3-30B-A3B}"
+: "${MODEL_PATH:=/home/ubuntu/mcp_atlas_sft_run/merged}"
 SERVED_MODEL_NAME="Qwen3-30B-A3B"
 
 N_SAMPLES_PER_PROMPT=8

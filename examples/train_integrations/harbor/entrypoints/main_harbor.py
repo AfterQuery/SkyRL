@@ -40,6 +40,7 @@ class HarborGeneratorConfig(GeneratorConfig):
     rate_limit: RateLimiterConfig = field(default_factory=RateLimiterConfig)
 
 
+
 @dataclass
 class HarborSkyRLConfig(SkyRLTrainConfig):
     """SkyRLTrainConfig with Harbor trial configuration."""

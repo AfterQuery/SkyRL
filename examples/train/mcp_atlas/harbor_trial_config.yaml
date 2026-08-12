@@ -17,17 +17,11 @@ agent:
   name: mcp-atlas
   override_timeout_sec: 1800
 
-  # Harbor's own setup budget, _AGENT_SETUP_TIMEOUT_SEC, defaults to 360s and can only be
-  # raised here. setup() boots the container's gateway and waits for /health, and the agent's
-  # own wait is up to gateway_ready_timeout_sec (600) plus the overlay seed -- so the default
-  # cannot contain it and trials died with AgentSetupTimeoutError before the gateway was up.
-  #
-  # Why the gateway is slow here at all: booting Postgres plus the simulated services is
-  # CPU-bound, and during training it competes with vLLM and FSDP for the same cores. In
-  # isolation 64 concurrent containers all answered /health in 85s and 128 in 170s; under
-  # training load the same work exceeded 360s. Lowering MAX_CONCURRENCY in the run script is
-  # the other half of the fix.
-  override_setup_timeout_sec: 1500
+  # No override_setup_timeout_sec. Harbor's default _AGENT_SETUP_TIMEOUT_SEC of 360s is
+  # ample: with the real delivery7 image, setup (gateway boot + /health + overlay seed) takes
+  # 18-99s. It was raised to 1500 while diagnosing AgentSetupTimeoutError, but that was the
+  # substitute image failing to seed 234 tasks, not slow boot -- a longer budget only delays
+  # the same failure.
 
   kwargs:
     # Per-turn prompt/completion token IDs and logprobs -> step-wise training with TIS.

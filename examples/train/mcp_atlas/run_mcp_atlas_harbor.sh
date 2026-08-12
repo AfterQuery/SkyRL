@@ -112,19 +112,17 @@ NUM_INFERENCE_ENGINES=4
 TP_SIZE=2
 ENABLE_RATE_LIMITING=true
 TRAJECTORIES_PER_SECOND=5
-# Far below run_codecontest.sh's 512, and lowered again after measurement. That script runs
-# on Daytona where a trial is a cloud sandbox; here each trial is a local container running
-# Postgres plus the simulated services, and bringing that up is CPU-bound.
+# Below run_codecontest.sh's 512 because that runs on Daytona, where a trial is a cloud
+# sandbox; here each trial is a local container running Postgres plus the simulated services.
 #
-# The cost of getting this wrong is not slowness, it is lost data: at 64, gateway boot
-# exceeded Harbor's setup budget and 456 of 1222 trials (37%) died with
-# AgentSetupTimeoutError, every one of them masked out of training. Booting containers
-# competes for cores with vLLM and FSDP -- in isolation 64 containers all answered /health in
-# 85s, but under training load the same work blew past 360s.
+# Measured on this host, container concurrency alone is not the constraint: 64 containers all
+# answered /health in 72-90s and 128 in 84-159s, both with zero Postgres-readiness failures.
+# This was briefly halved to 32 while diagnosing AgentSetupTimeoutError, which turned out to
+# be the substitute image failing to seed 234 tasks rather than contention.
 #
 # MINI_BATCH_SIZE * N_SAMPLES_PER_PROMPT = 256 trials are wanted per step either way; this
-# only sets how many run at once, and less contention per trial beats more trials in flight.
-MAX_CONCURRENCY=32
+# only sets how many run at once.
+MAX_CONCURRENCY=64
 
 # Harbor trial config, with trials_dir pointed at this run's storage.
 #
@@ -210,7 +208,7 @@ uv run --isolated --extra fsdp --extra harbor --env-file "$ENV_FILE" \
   trainer.logger=wandb \
   trainer.project_name=mcp_atlas_harbor \
   trainer.run_name=$RUN_NAME \
-  trainer.resume_mode=latest \
+  trainer.resume_mode=null \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \

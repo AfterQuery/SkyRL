@@ -68,24 +68,32 @@ decides which services boot, so only the task's tools exist at all (typically ~6
    name is unknown and trials fail at construction. Bump the `rev` and re-run `uv lock` after
    every harbor push, or the new kwargs get silently swallowed by the old pin.
 
-2. **The runtime image, locally.** Task Dockerfiles say `FROM mcp-atlas-runtime:<tag>` with no
-   registry, so the tag must resolve on the build host:
+2. **The runtime image, locally.** Task Dockerfiles say
+   `FROM mcp-atlas-runtime:delivery7-20260625` with no registry, so the tag must resolve in
+   the local image store on whatever host builds the tasks — Docker otherwise falls back to
+   `docker.io/library/...` and the build fails with "pull access denied".
 
    ```bash
-   gcloud auth activate-service-account --key-file ~/.gcp/afterquery-image-pull.json
-   gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin \
-     https://us-east1-docker.pkg.dev
-   docker pull us-east1-docker.pkg.dev/afterqueryai/mcp-atlas-redelivery-staging/runtime:redeliv-final3-20260622
-   docker tag  us-east1-docker.pkg.dev/afterqueryai/mcp-atlas-redelivery-staging/runtime:redeliv-final3-20260622 \
-               mcp-atlas-runtime:delivery7-20260625
+   docker load -i mcp-atlas-runtime-delivery7-20260625.tar.gz
    ```
 
-   Note the substitution: `delivery7-20260625` is not published anywhere reachable, so the
-   June 22 staging runtime stands in under that tag. 995/1000 task overlays are present in it
-   and a 40-task oracle sweep scored 1.0, so it is a sound stand-in — but it is a local alias,
-   and it is why `environment.type: docker` is the default while
-   **Daytona cannot work yet**: a remote builder has no such tag, and fixing that means
-   pushing the runtime to a registry and rewriting the task `FROM` lines fully-qualified.
+   It must be **this** image, not a substitute. The delivered task bundle and the runtime are
+   a matched pair: 3,905 worldlets, of which 395 are the `redeliv_*` files that 234 of the
+   1000 tasks name. Standing an earlier build in under the same tag is worse than having no
+   image at all — every task builds and boots, then the seed step fails on the missing
+   worldlet, and because `run_agent_environment.sh` runs under `set -e` it aborts before
+   `exec uvicorn`. The gateway never appears, and the trial surfaces as
+   `AgentSetupTimeoutError`, which reads like an infrastructure problem rather than a missing
+   file. Verify before trusting a run:
+
+   ```bash
+   docker run --rm --entrypoint sh mcp-atlas-runtime:delivery7-20260625 \
+     -c 'ls /workspace/runtime_env/worldlets | wc -l'    # expect 3905
+   ```
+
+   This is also why `environment.type` is `docker`: an unqualified `FROM` cannot resolve on a
+   remote builder, so Daytona needs the runtime pushed to a registry and the task `FROM` lines
+   made fully qualified.
 
 3. **Patch the bundles to use the LLM judge.** AQ bundles ship a deterministic proxy grader
    whose own docstring invites replacement. It is maximised by restating claim text, so a

@@ -112,12 +112,19 @@ NUM_INFERENCE_ENGINES=4
 TP_SIZE=2
 ENABLE_RATE_LIMITING=true
 TRAJECTORIES_PER_SECOND=5
-# Lower than run_codecontest.sh's 512 on purpose. That runs on Daytona, where trials are
-# cloud sandboxes; these are local Docker containers, each running Postgres plus the
-# simulated services, so the Docker daemon and image-layer contention bind long before RAM
-# does (a live task container measures ~305 MiB). MINI_BATCH_SIZE * N_SAMPLES = 256 trials
-# are wanted per step; the rest queue.
-MAX_CONCURRENCY=64
+# Far below run_codecontest.sh's 512, and lowered again after measurement. That script runs
+# on Daytona where a trial is a cloud sandbox; here each trial is a local container running
+# Postgres plus the simulated services, and bringing that up is CPU-bound.
+#
+# The cost of getting this wrong is not slowness, it is lost data: at 64, gateway boot
+# exceeded Harbor's setup budget and 456 of 1222 trials (37%) died with
+# AgentSetupTimeoutError, every one of them masked out of training. Booting containers
+# competes for cores with vLLM and FSDP -- in isolation 64 containers all answered /health in
+# 85s, but under training load the same work blew past 360s.
+#
+# MINI_BATCH_SIZE * N_SAMPLES_PER_PROMPT = 256 trials are wanted per step either way; this
+# only sets how many run at once, and less contention per trial beats more trials in flight.
+MAX_CONCURRENCY=32
 
 # Harbor trial config, with trials_dir pointed at this run's storage.
 #

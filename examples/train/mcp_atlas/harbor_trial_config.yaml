@@ -127,5 +127,7 @@ verifier:
     # term cannot be farmed independently of solving the task. Requires the task set to ship
     # tests/target_tools.json; without it recall is undefined and the reward is plain coverage.
     # reward.json also reports coverage and target_tool_recall separately, so the unshaped
-    # score stays comparable to the benchmark. Set 0 to disable.
+    # score stays comparable to the benchmark. 0.3 is the verifier's own default, restated
+    # here so the run's reward definition is readable in one place; set 0 to score exactly
+    # as the official scorer does.
     MCP_ATLAS_TOOL_REWARD_WEIGHT: "0.3"

@@ -15,10 +15,11 @@ set -ex
 #   1. The harbor dependency must include the mcp-atlas agent:
 #        pyproject.toml -> harbor = { git = ".../AfterQuery/harbor-aq", rev/branch = "aq" }
 #      On upstream Harbor, `agent.name: mcp-atlas` is unknown and trials fail immediately.
-#   2. Task bundles. For the AQ-1000 training set the bundles ship pre-built; patch them to
-#      score with the LLM judge (raw coverage) rather than the deterministic proxy grader:
-#        cd /path/to/harbor/adapters/mcp_atlas
-#        uv run use_llm_judge.py --tasks $HOME/AQ-MCP-Atlas-1000-Tasks/tasks
+#   2. Task bundles. AQ-1000 ships pre-built with a deterministic proxy grader; swap in the
+#      LLM judge (raw coverage) by copying it over tests/grade.py, into a COPY of the set:
+#        cp -r $HOME/AQ-MCP-Atlas-1000-Tasks/tasks $HOME/data/mcp_atlas_harbor/tasks
+#        for d in $HOME/data/mcp_atlas_harbor/tasks/*/; do \
+#          cp /path/to/harbor/adapters/mcp_atlas/template/tests/grade.py "$d/tests/grade.py"; done
 #      They need the runtime image present locally (see README).
 #   3. A judge for the verifier:
 #        export EVAL_LLM_BASE_URL=... EVAL_LLM_API_KEY=... EVAL_LLM_MODEL=...

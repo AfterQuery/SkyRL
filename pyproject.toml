@@ -322,7 +322,7 @@ torchvision = [
 ]
 # AfterQuery's Harbor fork: carries the mcp-atlas agent and adapter used by
 # examples/train/mcp_atlas. Bump this rev when landing commits on that fork's aq branch.
-harbor = { git = "https://github.com/AfterQuery/harbor-aq", rev = "93cf5d26f24a81e482361313f20d63d783c5da50" }
+harbor = { git = "https://github.com/AfterQuery/harbor-aq", rev = "7413a1d5a344611b1b4160667f7473293f8d012c" }
 megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev = "91a15142a4b4442a8d46ab539d1b923bd08570d0", marker = "sys_platform == 'linux'"}
 # megatron-core main branch: https://github.com/NVIDIA/Megatron-LM/tree/main latest as of 6/8/26
 megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "71e418ea7d7b3a6c9a53238c543c3e0b43e11026", marker = "sys_platform == 'linux'"}

@@ -181,11 +181,11 @@ Inputs are the two AfterQuery bundles (1000 Harbor-schema tasks, and 3 GLM-5.2 r
 task graded with the same claim-coverage judge). Unzip both, then:
 
 ```bash
-uv run examples/train/mcp_atlas/prepare_glm_sft_dataset.py \
-  --trajectories-dir ~/AQ-MCP-Atlas-1000-Trajectories-GLM-5.2 \
-  --tasks-dir ~/AQ-MCP-Atlas-1000-Tasks \
+uv run --extra skyrl-train examples/train/mcp_atlas/prepare_glm_sft_dataset.py \
+  --trajectories-dir ~/aq_full_delivery/AQ-MCP-Atlas-1000-Full-Delivery-20260812/trajectories \
+  --tasks-dir ~/aq_tasks_v2/AQ-MCP-Atlas-1000-Tasks \
   --output-dir ~/data/mcp_atlas_sft \
-  --min-coverage 1.0 --one-per-task
+  --min-coverage 0.85
 
 bash examples/train/mcp_atlas/run_sft_glm_warmstart.sh   # Qwen3-30B-A3B, LoRA, max_length=32768
 ```
@@ -216,13 +216,30 @@ The converter handles three things that matter:
   `enabled_tools` is included — *including distractors the teacher never called* — so the
   student faces the same choice the teacher did.
 
-Selection knobs: `--min-coverage 1.0 --one-per-task` yields 531 rollouts over 531 tasks
-(505 train / 26 validation). Dropping `--one-per-task` gives 1207 rows, but 256 of those 534
-tasks have all three runs perfect, so easy tasks would supply 64% of the data; measured across
-pairs of perfect runs the extra rollouts are largely redundant (mean tool-set Jaccard 0.855).
-`--prefer shortest` (default) breaks the frequent coverage-1.0 ties toward the fewest-tool-call
-demonstration. Rollouts with `status != graded` are always excluded — those are GLM never
-terminating (one hit 1053 tool calls), which carry no answer to learn from.
+Selection: one rollout per task is the **default**, not a flag — the highest-coverage run
+that clears `--min-coverage`. Without it a task whose three runs all scored well contributes
+three near-duplicate conversations, so easy tasks dominate the mixture (measured across pairs
+of perfect runs, the extra rollouts are largely redundant: mean tool-set Jaccard 0.855).
+`--no-one-per-task` opts out; `--prefer shortest` (default) breaks the frequent ties at
+coverage 1.0 toward the fewest-tool-call demonstration.
+
+Measured on the 2026-08-12 full delivery at `--min-coverage 0.85` (this bundle's own
+`pass_threshold`): **525 of 3000 rollouts over 525 tasks**, one dropped for exceeding the
+context, leaving 498 train / 26 validation. Rollouts with a recorded `error` are excluded —
+those are runs that died mid-flight, so the judge scored a partial answer rather than the
+trajectory.
+
+**One length control, and it is the context window.** `--max-length` (default 32768) drops
+rollouts whose tokenized conversation does not fit; nothing else is capped. Tool observations
+are kept byte-for-byte as the runner re-sends them, because reshaping them here would make SFT
+and RL disagree on every tool result, and turn count is unbounded. An earlier
+`--max-tool-calls 60` filter was removed for rejecting 20 perfectly trainable rollouts on a
+proxy for length when only one of them actually overflowed. Keep `--max-length` equal to
+`SFTConfig.max_length`, or the trainer truncates mid-answer and teaches the model to stop
+early.
+
+Measured lengths (Qwen3-30B-A3B tokenizer): mean 4647, median 3624, p90 7656, p99 20027,
+max 32673; trained tokens mean 1772, i.e. 38.1% of all tokens.
 
 **Reasoning and the chat template.** GLM's reasoning traces were not saved in the bundle, so
 the stock Qwen3 template injects an empty `<think>\n\n</think>` into the **final** assistant

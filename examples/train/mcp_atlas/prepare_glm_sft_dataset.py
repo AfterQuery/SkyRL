@@ -1,43 +1,54 @@
 """Convert GLM-5.2 teacher trajectories into an SFT dataset for warm-starting a smaller policy.
 
-Reads the ``AQ-MCP-Atlas-1000-Trajectories-GLM-5.2`` bundle (3 rollouts x 1000 Harbor tasks,
-each graded by claim-coverage LLM judge) plus the matching ``AQ-MCP-Atlas-1000-Tasks`` bundle,
-keeps only high-coverage rollouts, and writes parquet in the shape ``SFTTrainer`` expects:
-``messages`` (OpenAI format), ``tools`` (JSON-encoded function schemas), and ``task_id`` /
-``coverage`` metadata columns.
+Reads the ``AQ-MCP-Atlas-1000-Full-Delivery`` bundle (3 rollouts x 1000 Harbor tasks, each
+graded by the claim-coverage LLM judge) plus the matching task packages, keeps high-coverage
+rollouts, and writes parquet in the shape ``SFTTrainer`` expects: ``messages`` (OpenAI
+format), ``tools`` (JSON-encoded function schemas), and ``task_id`` / ``coverage`` metadata.
 
-Two conversions matter for correctness:
+The full-delivery bundle was produced by this repo's own ``mcp-atlas`` agent, which changes
+three things versus the earlier trajectories-only bundle:
 
-1. **Anthropic -> OpenAI messages.** The bundle stores assistant ``content`` as a block list
-   (``text`` / ``tool_use`` with a JSON-string ``input``) and tool results under
-   ``tool_use_id``. ``SFTTrainer`` tokenizes with ``apply_chat_template``, which wants
-   ``content`` as text plus a separate ``tool_calls`` list, and ``tool_call_id`` on tool
-   messages.
-2. **Tool observations are flattened the same way the RL generator flattens them** — MCP
-   content blocks joined on their ``text`` fields and capped at ``--max-tool-output-chars``
-   (the generator's ``tool_output_cap`` default). Warm-starting on a different observation
-   format than RL will produce is the main avoidable train/rollout mismatch.
+1. **No message conversion is needed.** ``trajectory.messages`` is already OpenAI format --
+   string ``content``, ``tool_calls`` carrying ``function.name`` plus a JSON-string
+   ``function.arguments``, and ``tool`` messages keyed by ``tool_call_id``.
 
-Tool JSON schemas are **not** shipped in either bundle (they live in the
-``mcp-atlas-runtime`` image), so parameter schemas are reconstructed from the argument keys
-the teacher actually used, unioned per tool name across the selected rollouts. Every tool in
-the task's ``enabled_tools`` is included -- including distractors the teacher never called,
-which get an empty parameter object -- because the teacher chose among the full list and the
-student should face the same choice.
+2. **Tool observations are kept verbatim, not flattened.** The runner stores each result as
+   the raw MCP block-list JSON and feeds exactly that back to the model, so flattening it
+   here would train the student on an observation format RL will never produce. Only
+   ``--max-tool-output-chars`` is applied, mirroring the runner's ``tool_output_cap``.
+
+3. **Reasoning is available.** ``trajectory.reasoning`` carries the teacher's chain of
+   thought per turn, keyed by ``step``. The earlier bundle had none, which is why a model
+   trained on it emitted a ``<think>`` block on only 3% of turns. It is re-injected into the
+   owning assistant turn as ``<think>...</think>`` so the student learns to reason before
+   acting; use ``--no-inject-reasoning`` to train on answers alone.
+
+   Reasoning is matched by ``step``, not by position: a turn whose response carried no
+   reasoning simply has no entry, so zipping the two lists would silently attach one turn's
+   thinking to another (measured: only 105 of 400 rollouts have equal counts).
+
+Tool JSON schemas are **not** shipped in the bundle (they live in the ``mcp-atlas-runtime``
+image), so parameter schemas are reconstructed from the argument keys the teacher actually
+used, unioned per tool name. Every tool in the task's ``enabled_tools`` is included --
+including distractors the teacher never called, which get an empty parameter object --
+because the teacher chose among the full list and the student should face the same choice.
 
 Usage::
 
-    uv run examples/train/mcp_atlas/prepare_glm_sft_dataset.py \\
-        --trajectories-dir ~/AQ-MCP-Atlas-1000-Trajectories-GLM-5.2 \\
+    uv run --extra skyrl-train examples/train/mcp_atlas/prepare_glm_sft_dataset.py \\
+        --trajectories-dir ~/aq_full_delivery/AQ-MCP-Atlas-1000-Full-Delivery-20260812/trajectories \\
         --tasks-dir ~/AQ-MCP-Atlas-1000-Tasks \\
         --output-dir ~/data/mcp_atlas_sft \\
-        --min-coverage 0.75 --one-per-task
+        --min-coverage 0.85
+
+`--extra skyrl-train` rather than `--extra fsdp`: the only SkyRL import here is the loss-mask
+helper, which transitively needs pydantic/torch/numpy but none of fsdp's CUDA-kernel wheels
+(causal-conv1d, flashinfer, flash-linear-attention). Those are fetched from GitHub releases
+and throttle when several processes resolve at once. Verified byte-identical output either way.
 """
 
 import argparse
 import collections
-import csv
-import gzip
 import json
 import random
 from pathlib import Path
@@ -69,83 +80,89 @@ def _parse_toml_string_list(text: str, key: str) -> List[str]:
     return [part.strip().strip('",').strip('"') for part in body.split("\n") if part.strip().strip(",").strip()]
 
 
-def _flatten_tool_result(raw: Any, cap: Optional[int]) -> str:
-    """Flatten an MCP tool result into observation text, mirroring the RL generator."""
-    text = raw if isinstance(raw, str) else json.dumps(raw)
-    try:
-        blocks = json.loads(text)
-        if isinstance(blocks, list):
-            joined = "\n".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
-            if joined:
-                text = joined
-    except (json.JSONDecodeError, TypeError):
-        pass
-    if cap and len(text) > cap:
-        text = text[:cap] + f"\n[... truncated to {cap} characters]"
-    return text
+def _tool_content(raw: Any) -> str:
+    """The tool observation exactly as the runner stores and re-sends it.
 
-
-def convert_messages(raw_messages: List[Dict[str, Any]], cap: Optional[int]) -> Tuple[List[Dict[str, Any]], int]:
-    """Convert one bundle transcript to OpenAI-format messages.
-
-    Returns the messages and the number of tool calls whose result was missing from the
-    transcript (dangling calls are kept -- predicting the call is valid signal -- but their
-    absent observations are simply not emitted).
+    Neither flattened nor truncated. The runner sets ``content`` to ``json.dumps`` of the
+    gateway's reply -- the raw MCP block list -- and feeds that straight back as history, so
+    that is the observation format RL produces; reshaping it here would make SFT and RL
+    disagree on every tool result. Trajectory length is governed by one thing only, the
+    context budget applied after tokenization.
     """
-    # Index tool results by the call id they answer.
-    results: Dict[str, Dict[str, Any]] = {}
-    for msg in raw_messages:
-        if msg.get("role") == "tool":
-            results[msg.get("tool_use_id")] = msg
+    return raw if isinstance(raw, str) else json.dumps(raw)
 
+
+def reasoning_by_turn(reasoning: List[Dict[str, Any]]) -> Dict[int, str]:
+    """Map assistant-turn index -> chain of thought, keyed by the recorded ``step``.
+
+    The runner appends one entry per turn that produced reasoning, stamped with the loop
+    step, which equals the assistant-turn index. Turns whose response carried none are
+    absent, so this must be a lookup by step rather than a zip: only 105 of 400 rollouts
+    have as many reasoning entries as assistant turns, and pairing by position would attach
+    one turn's thinking to a later turn's answer.
+    """
+    out: Dict[int, str] = {}
+    for entry in reasoning or []:
+        if not isinstance(entry, dict):
+            continue
+        step, text = entry.get("step"), entry.get("text")
+        if isinstance(step, int) and text:
+            out[step] = text
+    return out
+
+
+def convert_messages(
+    raw_messages: List[Dict[str, Any]],
+    reasoning: Optional[Dict[int, str]] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Normalise one full-delivery transcript for ``apply_chat_template``.
+
+    The bundle is already OpenAI-shaped, so this only copies it through and, when
+    ``reasoning`` is given, prefixes each assistant turn with its ``<think>`` block.
+
+    Returns the messages and the number of tool messages that answer no known call id --
+    kept rather than dropped, since predicting the call is valid signal, but counted so a
+    malformed bundle is visible instead of silently shrinking the dataset.
+    """
+    known_ids = {
+        call.get("id")
+        for msg in raw_messages
+        if isinstance(msg, dict)
+        for call in (msg.get("tool_calls") or [])
+    }
     out: List[Dict[str, Any]] = []
-    missing = 0
+    dangling = 0
+    assistant_index = 0
     for msg in raw_messages:
+        if not isinstance(msg, dict):
+            continue
         role = msg.get("role")
-        if role == "user":
-            out.append({"role": "user", "content": msg.get("content") or ""})
+        if role == "assistant":
+            content = msg.get("content") or ""
+            if reasoning is not None:
+                think = reasoning.get(assistant_index)
+                if think:
+                    content = f"<think>\n{think.strip()}\n</think>\n\n{content}"
+            turn: Dict[str, Any] = {"role": "assistant", "content": content}
+            if msg.get("tool_calls"):
+                turn["tool_calls"] = msg["tool_calls"]
+            out.append(turn)
+            assistant_index += 1
         elif role == "tool":
-            continue  # emitted alongside the assistant turn that requested it
-        elif role == "assistant":
-            content = msg.get("content")
-            if isinstance(content, str):
-                out.append({"role": "assistant", "content": content})
-                continue
-            texts, tool_calls = [], []
-            for block in content or []:
-                btype = block.get("type")
-                if btype == "text":
-                    texts.append(block.get("text") or "")
-                elif btype == "tool_use":
-                    raw_input = block.get("input")
-                    arguments = raw_input if isinstance(raw_input, str) else json.dumps(raw_input or {})
-                    tool_calls.append(
-                        {
-                            "id": block.get("id"),
-                            "type": "function",
-                            "function": {"name": block.get("name"), "arguments": arguments},
-                        }
-                    )
-            assistant: Dict[str, Any] = {"role": "assistant", "content": "\n".join(t for t in texts if t)}
-            if tool_calls:
-                assistant["tool_calls"] = tool_calls
-            out.append(assistant)
-            # Append this turn's observations in call order.
-            for call in tool_calls:
-                result = results.get(call["id"])
-                if result is None:
-                    missing += 1
-                    continue
-                out.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": _flatten_tool_result(result.get("content"), cap),
-                    }
-                )
+            if msg.get("tool_call_id") not in known_ids:
+                dangling += 1
+            out.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id"),
+                    "content": _tool_content(msg.get("content")),
+                }
+            )
+        elif role in ("user", "system"):
+            out.append({"role": role, "content": msg.get("content") or ""})
         else:
             raise ValueError(f"Unexpected role {role!r} in trajectory")
-    return out, missing
+    return out, dangling
 
 
 def build_tool_schemas(enabled_tools: List[str], observed_args: Dict[str, Dict[str, str]]) -> List[Dict[str, Any]]:
@@ -210,20 +227,29 @@ def pretokenize_row(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--trajectories-dir", required=True, help="Extracted GLM trajectories bundle.")
+    parser.add_argument(
+        "--trajectories-dir",
+        required=True,
+        help="The full-delivery bundle's `trajectories/` directory (contains rollouts/).",
+    )
     parser.add_argument("--tasks-dir", required=True, help="Extracted AQ-MCP-Atlas-1000-Tasks bundle.")
     parser.add_argument("--output-dir", default="~/data/mcp_atlas_sft", help="Where to write train/val parquet.")
     parser.add_argument(
         "--min-coverage",
         type=float,
-        default=0.75,
-        help="Keep only rollouts whose judge coverage is >= this (the bundle's pass threshold).",
+        default=0.85,
+        help="Keep only rollouts whose judge coverage is >= this. The full-delivery bundle "
+        "sets pass_threshold=0.85 (the earlier bundle used 0.75).",
     )
     parser.add_argument(
         "--one-per-task",
-        action="store_true",
-        help="Keep only the highest-coverage rollout per task, so easy tasks with 3 good runs "
-        "do not dominate the mixture.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep exactly one rollout per task -- the highest-coverage run that clears "
+        "--min-coverage (default). Without it a task whose three runs all scored well "
+        "contributes three near-duplicate conversations, so easy tasks dominate the mixture: "
+        "measured across pairs of perfect runs the extra rollouts are largely redundant (mean "
+        "tool-set Jaccard 0.855). Use --no-one-per-task to keep every qualifying rollout.",
     )
     parser.add_argument(
         "--prefer",
@@ -234,17 +260,28 @@ def main() -> None:
         "token weight easy tasks get under per-token loss normalization).",
     )
     parser.add_argument(
-        "--max-tool-output-chars",
-        type=int,
-        default=10000,
-        help="Cap per tool observation; match generator tool_output_cap so SFT and RL agree. 0 = uncapped.",
+        "--inject-reasoning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prefix each assistant turn with the teacher's <think> block (default). The "
+        "earlier bundle shipped no reasoning, and a model trained on it produced a think "
+        "block on only 3%% of turns; this bundle has it, matched by recorded step.",
     )
-    parser.add_argument("--max-tool-calls", type=int, default=60, help="Drop rollouts with more calls than this.")
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=32768,
+        help="The only length control: drop rollouts whose tokenized conversation exceeds "
+        "this many tokens. Set it to the policy's context window (and to SFTConfig.max_length, "
+        "which would otherwise silently truncate a row mid-answer). Nothing else is capped -- "
+        "tool observations are kept byte-for-byte as the runner re-sends them, and turn count "
+        "is unbounded -- so trajectory length is governed here and nowhere else. 0 disables it.",
+    )
     parser.add_argument("--val-fraction", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--tokenizer",
-        default="Qwen/Qwen3-8B",
+        default="Qwen/Qwen3-30B-A3B",
         help="Tokenizer for pre-tokenization and sequence-length stats.",
     )
     parser.add_argument(
@@ -275,30 +312,57 @@ def main() -> None:
 
     traj_dir = Path(args.trajectories_dir).expanduser().resolve()
     tasks_dir = Path(args.tasks_dir).expanduser().resolve()
-    index_path = traj_dir / "index.csv"
-    if not index_path.is_file():
-        raise SystemExit(f"index.csv not found under {traj_dir}")
-    cap = args.max_tool_output_chars or None
+    rollout_dir = traj_dir / "rollouts"
+    if not rollout_dir.is_dir():
+        raise SystemExit(
+            f"{rollout_dir} not found. Point --trajectories-dir at the full-delivery bundle's "
+            "`trajectories/` directory. (The earlier bundle's index.csv layout is not supported "
+            "by this script; its transcripts were Anthropic-shaped and carried no reasoning.)"
+        )
+    manifest_path = traj_dir / "manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        print(
+            f"Batch {manifest.get('batch_id')}: model={manifest.get('model')} "
+            f"judge={manifest.get('judge_model')} pass_threshold={manifest.get('pass_threshold')} "
+            f"mean_coverage={manifest.get('mean_coverage')}"
+        )
 
-    # 1. Select rollouts from the index (no decompression needed).
-    rows = list(csv.DictReader(index_path.open()))
-    selected = []
-    for row in rows:
-        if row["status"] != "graded":
+    # 1. Read every rollout and select on the judge's coverage.
+    rollouts = sorted(rollout_dir.glob("*.json"))
+    if not rollouts:
+        raise SystemExit(f"No rollout files under {rollout_dir}")
+    selected, unusable = [], collections.Counter()
+    for path in rollouts:
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            unusable["unparseable"] += 1
             continue
-        coverage = row.get("coverage")
-        if not coverage:
+        traj = payload.get("trajectory") or {}
+        if not traj.get("messages"):
+            unusable["no messages"] += 1
             continue
-        coverage = float(coverage)
+        # A rollout that errored mid-flight still has the turns it completed, but its final
+        # answer is missing or partial and the judge scored that, not the trajectory.
+        if traj.get("error"):
+            unusable["errored"] += 1
+            continue
+        coverage = (payload.get("reward") or {}).get("coverage")
+        if coverage is None:
+            unusable["ungraded"] += 1
+            continue
         if coverage < args.min_coverage:
+            unusable[f"coverage < {args.min_coverage}"] += 1
             continue
-        if args.max_tool_calls and int(row["tool_calls"] or 0) > args.max_tool_calls:
-            continue
-        selected.append((row["task_id"], int(row["run"]), coverage, row["file"], int(row["tool_calls"] or 0)))
+        n_calls = len(traj.get("tool_calls") or [])
+        selected.append(
+            (payload.get("task_id"), int(payload.get("run_index") or 0), float(coverage), path, n_calls)
+        )
 
     if args.one_per_task:
-        # Rank by coverage first, then break ties with --prefer. Ties are the common case at
-        # coverage 1.0: 256 of the 534 perfect tasks have all three rollouts perfect.
+        # Rank by coverage, then break ties with --prefer. Ties at the top are common: the
+        # bundle reports mean coverage near 0.7 with a large mass at 1.0.
         def sort_key(item):
             _, run, coverage, _, n_calls = item
             if args.prefer == "shortest":
@@ -313,13 +377,20 @@ def main() -> None:
         selected = list(best.values())
 
     if not selected:
-        raise SystemExit("No rollouts passed the filters.")
+        raise SystemExit(f"No rollouts passed the filters. Rejected: {dict(unusable)}")
+    if args.one_per_task:
+        # Asserted rather than assumed: this is the guarantee the mixture depends on, and a
+        # duplicate would quietly double one task's weight.
+        per_task = collections.Counter(task for task, _, _, _, _ in selected)
+        duplicated = {t: n for t, n in per_task.items() if n > 1}
+        assert not duplicated, f"one-per-task violated for {duplicated}"
     print(
-        f"Selected {len(selected)} rollouts from {len(rows)} "
-        f"(status=graded, coverage>={args.min_coverage}"
-        f"{', one per task' if args.one_per_task else ''}) "
+        f"Selected {len(selected)} of {len(rollouts)} rollouts "
+        f"(coverage>={args.min_coverage}{', one per task' if args.one_per_task else ''}) "
         f"covering {len({t for t, _, _, _, _ in selected})} tasks"
     )
+    if unusable:
+        print(f"  rejected: {dict(unusable.most_common())}")
 
     # 2. Load each task's enabled_tools (includes distractors the teacher had to reject).
     enabled_by_task: Dict[str, List[str]] = {}
@@ -332,28 +403,31 @@ def main() -> None:
     if missing_tasks:
         print(f"WARNING: {len(set(missing_tasks))} tasks missing task.toml; their rows get tools=[]")
 
-    # 3. Pass one: convert transcripts and collect observed argument types per tool name.
+    # 3. Pass one: normalise transcripts and collect observed argument types per tool name.
     observed_args: Dict[str, Dict[str, str]] = collections.defaultdict(dict)
     converted: List[tuple] = []
-    total_missing_results = 0
+    total_dangling = 0
     skipped = 0
-    for task_id, run, coverage, relpath, _ in selected:
-        path = traj_dir / relpath
-        if not path.is_file():
-            skipped += 1
-            continue
-        traj = json.load(gzip.open(path, "rt"))
+    with_reasoning = 0
+    for task_id, run, coverage, path, _ in selected:
+        payload = json.loads(path.read_text())
+        traj = payload["trajectory"]
+        reasoning = reasoning_by_turn(traj.get("reasoning") or []) if args.inject_reasoning else None
         try:
-            messages, missing = convert_messages(traj["messages"], cap)
+            messages, dangling = convert_messages(traj["messages"], reasoning)
         except ValueError as exc:
             print(f"WARNING: skipping {task_id} run{run}: {exc}")
             skipped += 1
             continue
-        total_missing_results += missing
+        total_dangling += dangling
         if not any(m["role"] == "assistant" for m in messages):
             skipped += 1
             continue
-        for call in traj.get("tool_calls", []):
+        if reasoning:
+            with_reasoning += 1
+        # trajectory.tool_calls records arguments as a dict (the runner parsed them), which is
+        # what the schema reconstruction needs; the copies inside messages are JSON strings.
+        for call in traj.get("tool_calls") or []:
             name, call_args = call.get("name"), call.get("arguments")
             if not name or not isinstance(call_args, dict):
                 continue
@@ -361,7 +435,9 @@ def main() -> None:
                 observed_args[name].setdefault(key, _JSON_TYPE.get(type(value), "string"))
         converted.append((task_id, run, coverage, messages))
 
-    print(f"Converted {len(converted)} rollouts (skipped {skipped}); {total_missing_results} tool calls had no result")
+    print(f"Converted {len(converted)} rollouts (skipped {skipped}); {total_dangling} tool messages answered no known call")
+    if args.inject_reasoning:
+        print(f"Injected teacher reasoning into {with_reasoning}/{len(converted)} rollouts")
     print(f"Reconstructed parameter schemas for {len(observed_args)} distinct tools from teacher usage")
 
     # 4. Pass two: attach per-task tool schemas and emit rows.
@@ -393,20 +469,38 @@ def main() -> None:
         else:
             print(f"Pre-tokenizing with the {args.tokenizer} default chat template")
 
-        tokenized_rows, dropped = [], 0
+        tokenized_rows, no_trainable, over_length = [], 0, []
         for row in out_rows:
             tokenized = pretokenize_row(row["messages"], json.loads(row["tools"]) or None, tokenizer, chat_template)
             if tokenized is None or sum(tokenized["loss_mask"]) == 0:
-                dropped += 1
+                no_trainable += 1
+                continue
+            n = len(tokenized["input_ids"])
+            # The single length control. Dropped rather than truncated: cutting a conversation
+            # mid-answer trains the model to stop early, and cutting the prompt end detaches
+            # the observations an answer was derived from.
+            if args.max_length and n > args.max_length:
+                over_length.append(n)
                 continue
             tokenized_rows.append({**tokenized, "task_id": row["task_id"], "coverage": row["coverage"]})
-        if dropped:
-            print(f"Dropped {dropped} rows with no trainable assistant tokens")
+        if no_trainable:
+            print(f"Dropped {no_trainable} rows with no trainable assistant tokens")
+        if over_length:
+            over_length.sort()
+            print(
+                f"Dropped {len(over_length)} rows over --max-length={args.max_length} "
+                f"(their lengths: median={over_length[len(over_length)//2]}, max={over_length[-1]})"
+            )
         out_rows = tokenized_rows
 
         think_ids = {tid for tag in ("<think>", "</think>") for tid in tokenizer.encode(tag, add_special_tokens=False)}
         with_think = sum(1 for r in out_rows if think_ids & set(r["input_ids"]))
-        print(f"Rows containing a <think> tag: {with_think}/{len(out_rows)} (0 means no empty blocks injected)")
+        expectation = (
+            "expected to be high: teacher reasoning is being trained on"
+            if args.inject_reasoning
+            else "expected 0: the template must not inject empty blocks"
+        )
+        print(f"Rows containing a <think> tag: {with_think}/{len(out_rows)} ({expectation})")
 
     num_val = int(len(out_rows) * args.val_fraction) if args.val_fraction > 0 else 0
     val_rows, train_rows = out_rows[:num_val], out_rows[num_val:]

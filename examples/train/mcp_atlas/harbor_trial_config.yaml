@@ -71,13 +71,22 @@ environment:
   force_build: false
   delete: true
 
-  # No override_cpus / override_memory_mb on purpose. None of the 1000 AQ tasks declares
-  # cpus, memory_mb or storage_mb -- their [environment] blocks carry only os and
-  # build_timeout_sec -- and Harbor's defaults are None, i.e. no limit. Setting overrides
-  # here would be the only source of a limit, and `suppress_override_warnings` would hide
-  # it if a task ever did declare its own. Measured: a live task container running the
-  # gateway plus five simulated services uses ~305 MiB and ~0.1% of one CPU, so a limit
-  # protects nothing and an 8 GB cap could only OOM-kill a heavier task.
+  # These must be set to null EXPLICITLY, not omitted. main_harbor deep-merges this config
+  # onto harbor_trial_config/default.yaml, so a key we leave out keeps the default's value --
+  # which is 1 CPU / 1024 MB / 1024 MB, sized for terminus-2 on a coding task. An MCP-Atlas
+  # container runs Postgres plus the simulated services: measured at ~296 MiB idle but CPU
+  # bound at boot, and 1 CPU stretched agent_setup from ~18s to 103s.
+  #
+  # null means "no limit", which is also what the tasks themselves ask for: none of the 1000
+  # declares cpus, memory_mb or storage_mb.
+  override_cpus: null
+  override_memory_mb: null
+  override_storage_mb: null
+  kwargs:
+    # Daytona-only knob inherited from the default config and meaningless for docker. An
+    # empty dict would not remove it: deep-merge recurses into dicts, so a key can only be
+    # cleared by setting it to null.
+    auto_stop_interval_mins: null
 
   # No MCP-server API keys here. AQ-1000's services are simulated inside the runtime image
   # and served by the container-local gateway, so none is read. They would matter only for

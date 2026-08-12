@@ -106,8 +106,6 @@ uv run --isolated --extra fsdp \
     model.lora.alpha=$LORA_ALPHA \
     model.lora.target_modules="$LORA_TARGETS" \
     pretokenized_dataset_paths="['$DATA_DIR/train.parquet']" \
-    eval_pretokenized_dataset_paths="['$DATA_DIR/validation.parquet']" \
-    eval_interval=5 \
     max_length=$MAX_LENGTH \
     num_epochs=$NUM_EPOCHS \
     batch_size=$BATCH_SIZE \

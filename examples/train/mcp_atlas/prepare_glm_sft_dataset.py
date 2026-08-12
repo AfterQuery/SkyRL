@@ -277,7 +277,15 @@ def main() -> None:
         "tool observations are kept byte-for-byte as the runner re-sends them, and turn count "
         "is unbounded -- so trajectory length is governed here and nowhere else. 0 disables it.",
     )
-    parser.add_argument("--val-fraction", type=float, default=0.05)
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction held out as a validation split. Defaults to 0: every qualifying "
+        "rollout trains. At this size (a few hundred rows after one-per-task selection) a 5%% "
+        "split is ~26 rows, too few to read a loss curve from and a measurable slice of the "
+        "data to give up. Pass e.g. 0.05 to reinstate one.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--tokenizer",

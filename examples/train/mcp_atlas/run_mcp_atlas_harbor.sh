@@ -17,15 +17,11 @@ set -ex
 #      docker pull us-east1-docker.pkg.dev/afterqueryai/mcp-atlas-redelivery-staging/runtime:redeliv-final3-20260622
 #      docker tag  <that> mcp-atlas-runtime:delivery7-20260625
 #
-# 3. Task bundles with the LLM judge swapped in, split so eval is not part of training:
+# 3. Task bundles with the LLM judge swapped in. All 1000 AQ tasks are the training set.
+#    Patch a COPY -- editing the delivered set in place is how it ends up with stale graders:
 #      HARBOR=/path/to/harbor/adapters/mcp_atlas
-#      # eval: first 20 tasks
-#      mkdir -p ~/data/mcp_atlas_eval20 && \
-#        for d in $(ls -d ~/AQ-MCP-Atlas-1000-Tasks/tasks/*/ | head -20); do cp -r "$d" ~/data/mcp_atlas_eval20/; done
-#      # train: the remaining 980
-#      mkdir -p ~/data/mcp_atlas_train && \
-#        for d in $(ls -d ~/AQ-MCP-Atlas-1000-Tasks/tasks/*/ | tail -n +21); do cp -r "$d" ~/data/mcp_atlas_train/; done
-#      for d in ~/data/mcp_atlas_eval20/*/ ~/data/mcp_atlas_train/*/; do cp $HARBOR/template/tests/grade.py "$d/tests/grade.py"; done
+#      cp -r ~/AQ-MCP-Atlas-1000-Tasks/tasks ~/data/mcp_atlas_train
+#      for d in ~/data/mcp_atlas_train/*/; do cp $HARBOR/template/tests/grade.py "$d/tests/grade.py"; done
 #
 # 4. API keys. Real secrets belong in .env.mcp_atlas.local (gitignored); the committed
 #    .env.mcp_atlas holds placeholders only. Override with ENV_FILE=... to point elsewhere.
@@ -38,8 +34,9 @@ set -ex
 # Dataset setup
 #-----------------------
 # Harbor tasks are directories of bundles, not parquet: main_harbor takes the paths directly.
+# All 1000 AQ tasks train. No eval: get_eval_dataset() returns None when val_data is unset or
+# eval_interval <= 0, so both are omitted below and no held-out set is reserved.
 TRAIN_DATA="['$HOME/data/mcp_atlas_train']"
-EVAL_DATA="['$HOME/data/mcp_atlas_eval20']"
 
 #-----------------------
 # Directory setup
@@ -115,12 +112,31 @@ TRAJECTORIES_PER_SECOND=5
 MAX_CONCURRENCY=64
 
 # Harbor trial config, with trials_dir pointed at this run's storage.
+#
+# ${VAR} is Harbor's env-template syntax, resolved inside the trial so secrets stay out of
+# persisted configs. But this dict passes through Hydra first, and OmegaConf reads ${...} as
+# its own interpolation -- ${MCP_ATLAS_JUDGE_KEY} looks like a custom resolver call and dies
+# with "Unsupported interpolation type". Escaping to \${...} makes OmegaConf yield the
+# literal string, which Harbor then resolves as intended. run_codecontest.sh never hits this
+# because its trial config contains no templates at all.
 HARBOR_TRIAL_CONFIG_JSON="$(
   TRIALS_DIR="$TRIALS_DIR" python3 -c '
 import json, os, sys, yaml
+
+
+def escape(o):
+    if isinstance(o, str):
+        return o.replace("${", "\\${")
+    if isinstance(o, dict):
+        return {k: escape(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [escape(v) for v in o]
+    return o
+
+
 cfg = yaml.safe_load(open(sys.argv[1]))
 cfg["trials_dir"] = os.environ["TRIALS_DIR"]
-print(json.dumps(cfg))
+print(json.dumps(escape(cfg)))
 ' "$TRIAL_CONFIG"
 )"
 
@@ -131,7 +147,6 @@ print(json.dumps(cfg))
 uv run --isolated --extra fsdp --extra harbor --env-file "$ENV_FILE" \
   -m examples.train_integrations.harbor.entrypoints.main_harbor \
   data.train_data="$TRAIN_DATA" \
-  data.val_data="$EVAL_DATA" \
   trainer.policy.model.path="$MODEL_PATH" \
   generator.inference_engine.served_model_name=$SERVED_MODEL_NAME \
   harbor_trial_config="$HARBOR_TRIAL_CONFIG_JSON" \
@@ -161,8 +176,6 @@ uv run --isolated --extra fsdp --extra harbor --env-file "$ENV_FILE" \
   generator.inference_engine.engine_init_kwargs.enable_auto_tool_choice=true \
   generator.inference_engine.engine_init_kwargs.tool_call_parser=hermes \
   trainer.epochs=3 \
-  trainer.eval_batch_size=20 \
-  trainer.eval_before_train=false \
   trainer.eval_interval=-1 \
   trainer.update_epochs_per_batch=1 \
   trainer.train_batch_size=$MINI_BATCH_SIZE \
@@ -177,7 +190,6 @@ uv run --isolated --extra fsdp --extra harbor --env-file "$ENV_FILE" \
   generator.step_wise_trajectories=true \
   generator.merge_stepwise_output=true \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
-  generator.eval_n_samples_per_prompt=2 \
   generator.apply_overlong_filtering=$APPLY_OVERLONG_FILTERING \
   generator.inference_engine.gpu_memory_utilization=0.8 \
   trainer.logger=wandb \

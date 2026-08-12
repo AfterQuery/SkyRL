@@ -18,9 +18,6 @@ agent:
   override_timeout_sec: 1800
 
   kwargs:
-    # vLLM ignores the key, but the in-container runner refuses to start without one.
-    api_key: "${MCP_ATLAS_API_KEY:-local}"
-
     # Per-turn prompt/completion token IDs and logprobs -> step-wise training with TIS.
     # The runner gets them from the endpoint directly (logprobs + vLLM's
     # return_token_ids), since the loop runs in-container and never touches Harbor's LLM
@@ -82,31 +79,9 @@ environment:
   # gateway plus five simulated services uses ~305 MiB and ~0.1% of one CPU, so a limit
   # protects nothing and an 8 GB cap could only OOM-kill a heavier task.
 
-  # Keys for the key-gated MCP servers, forwarded into the task container. `:-` supplies an
-  # empty default so a missing key does not fail the trial -- that server just stays
-  # disabled, and only tasks needing it fail. Mostly irrelevant for AQ-1000, whose services
-  # are simulated inside the image. Populate via .env.mcp_atlas.local.
-  env:
-    AIRTABLE_API_KEY: "${AIRTABLE_API_KEY:-}"
-    ALCHEMY_API_KEY: "${ALCHEMY_API_KEY:-}"
-    BRAVE_API_KEY: "${BRAVE_API_KEY:-}"
-    E2B_API_KEY: "${E2B_API_KEY:-}"
-    EXA_API_KEY: "${EXA_API_KEY:-}"
-    GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
-    GOOGLE_MAPS_API_KEY: "${GOOGLE_MAPS_API_KEY:-}"
-    GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID:-}"
-    GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET:-}"
-    GOOGLE_REFRESH_TOKEN: "${GOOGLE_REFRESH_TOKEN:-}"
-    LARA_ACCESS_KEY_ID: "${LARA_ACCESS_KEY_ID:-}"
-    LARA_ACCESS_KEY_SECRET: "${LARA_ACCESS_KEY_SECRET:-}"
-    MONGODB_CONNECTION_STRING: "${MONGODB_CONNECTION_STRING:-}"
-    NOTION_TOKEN: "${NOTION_TOKEN:-}"
-    NPS_API_KEY: "${NPS_API_KEY:-}"
-    OXYLABS_USERNAME: "${OXYLABS_USERNAME:-}"
-    OXYLABS_PASSWORD: "${OXYLABS_PASSWORD:-}"
-    SLACK_MCP_XOXC_TOKEN: "${SLACK_MCP_XOXC_TOKEN:-}"
-    SLACK_MCP_XOXD_TOKEN: "${SLACK_MCP_XOXD_TOKEN:-}"
-    WEATHER_API_KEY: "${WEATHER_API_KEY:-}"
+  # No MCP-server API keys here. AQ-1000's services are simulated inside the runtime image
+  # and served by the container-local gateway, so none is read. They would matter only for
+  # the upstream 500-task set, whose servers are real.
 
 verifier:
   disable: false

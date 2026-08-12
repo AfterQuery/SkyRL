@@ -27,10 +27,16 @@ agent:
     # layer. SkyRL force-enables this for step-wise; set here so it is explicit.
     collect_rollout_details: true
 
-    # Eval leaves these uncapped to match upstream. Training does not: every turn re-sends
-    # the whole history plus all tool output, so uncapped output walks the prompt into
-    # --max-model-len, the endpoint returns HTTP 400, and the trajectory is masked out
-    # instead of contributing gradient. AQ task.toml sets max_steps = 20.
+    # Eval uses the upstream harness numbers (256 turns, uncapped tool output). Training
+    # cannot: every turn re-sends the whole history plus all tool output, so uncapped
+    # output walks the prompt into --max-model-len, the endpoint returns HTTP 400, and the
+    # trajectory is masked out instead of contributing gradient. AQ task.toml sets
+    # max_steps = 20, which is also what the rubrics were authored against.
+    #
+    # Upstream's own answer to this is compaction (context_window_management='compact',
+    # truncating tool results older than the last two turns to 1500 chars). Not usable
+    # here: it rewrites earlier turns, and step-wise RL needs each turn's prompt to remain
+    # a prefix-extension of the previous one.
     max_steps: 20
     tool_output_cap: 4000
     max_tokens: 4096
@@ -52,9 +58,14 @@ environment:
   type: docker
   force_build: false
   delete: true
-  override_cpus: 4
-  override_memory_mb: 8192
-  suppress_override_warnings: true
+
+  # No override_cpus / override_memory_mb on purpose. None of the 1000 AQ tasks declares
+  # cpus, memory_mb or storage_mb -- their [environment] blocks carry only os and
+  # build_timeout_sec -- and Harbor's defaults are None, i.e. no limit. Setting overrides
+  # here would be the only source of a limit, and `suppress_override_warnings` would hide
+  # it if a task ever did declare its own. Measured: a live task container running the
+  # gateway plus five simulated services uses ~305 MiB and ~0.1% of one CPU, so a limit
+  # protects nothing and an 8 GB cap could only OOM-kill a heavier task.
 
   # Keys for the key-gated MCP servers, forwarded into the task container. `:-` supplies an
   # empty default so a missing key does not fail the trial -- that server just stays

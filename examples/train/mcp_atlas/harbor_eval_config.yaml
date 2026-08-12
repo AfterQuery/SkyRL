@@ -39,9 +39,11 @@ agents:
       api_base: http://127.0.0.1:8000/v1
       # vLLM ignores the key, but the runner refuses to proceed without one.
       api_key: "${MCP_ATLAS_API_KEY:-local}"
-      # Steps and tool output stay uncapped, matching upstream's --max-turns and
-      # --tool-output-cap defaults of None. The agent derives a wall-clock deadline from
-      # the trial's agent timeout so a non-terminating rollout still yields a trajectory.
-      max_steps: 0
+      # Matches the upstream harness: 256 turns (DEFAULT_MAX_TURNS) and uncapped tool
+      # output (toolOutputCap unset). run_eval.py's --max-turns=None means "do not
+      # override the harness", not "no limit". The agent also derives a wall-clock
+      # deadline from the trial's agent timeout, so a non-terminating rollout still
+      # yields its trajectory instead of being killed mid-exec.
+      max_steps: 256
       tool_output_cap: 0
       max_tokens: 8192

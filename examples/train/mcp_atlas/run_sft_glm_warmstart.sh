@@ -79,6 +79,25 @@ WARMUP_STEPS=5
 
 NUM_GPUS=8
 
+# Build the environment before launching, and fall back to the cache if the network is
+# uncooperative. Two of this extra's wheels are GitHub release assets (causal-conv1d among
+# them); when several processes resolve at once GitHub answers with HTTP/2 "refused stream"
+# and 503, and uv then fails to generate package metadata. Resolving up front means that
+# failure happens here, in a second, rather than after the model has started loading -- and
+# UV_OFFLINE only ever succeeds if every dependency is already cached, so it cannot mask a
+# genuinely missing one.
+UV_ARGS=(--isolated --extra fsdp)
+if ! uv run "${UV_ARGS[@]}" python -c pass >/dev/null 2>&1; then
+  echo "environment build failed (likely a throttled GitHub release asset); retrying from cache"
+  if UV_OFFLINE=1 uv run "${UV_ARGS[@]}" python -c pass >/dev/null 2>&1; then
+    export UV_OFFLINE=1
+    echo "  cache is warm; continuing with UV_OFFLINE=1"
+  else
+    echo "  could not build the environment offline either -- not a transient fetch failure" >&2
+    exit 1
+  fi
+fi
+
 uv run --isolated --extra fsdp \
     python -m skyrl.train.main_sft \
     strategy=fsdp \

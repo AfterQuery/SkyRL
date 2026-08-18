@@ -1,0 +1,79 @@
+name: Block committed .env credentials
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check-committed-env:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      # Full history, but NO file contents. The guard diffs against a base ref,
+      # so a shallow clone cannot resolve the merge base -- but it does not need
+      # the repository's files, and asking for them does not scale: a plain
+      # `fetch-depth: 0` checkout of a 12.5 GB repo was CANCELLED at the job
+      # timeout, leaving a check that could never once run. A check that cannot
+      # complete is worse than an absent one; it looks configured.
+      #
+      # `filter: blob:none` fetches commits and trees only, and `sparse-checkout`
+      # materialises just the guard itself. Any .env the diff names is then read
+      # with `--read-from`, which pulls exactly that one blob on demand.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          # SECRETS.md is listed because the remediation message points at it
+          # only when it exists. Leaving it out of the checkout would make that
+          # pointer depend on the checkout shape rather than on the repo, and it
+          # would quietly stop printing in the one repo that has the file.
+          sparse-checkout: |
+            bin
+            SECRETS.md
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Runs on every trigger. A detector that silently stops matching reports
+      # "clean" forever, so the self-test is what makes a pass mean anything --
+      # it asserts the guard fires on real credentials, leaves .env.example
+      # alone, and does not leak key material into its own output.
+      - name: Prove the detector still works
+        run: python3 bin/check-committed-env.py --selftest
+
+      - name: Check files this PR adds or modifies
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --quiet origin "${{ github.base_ref }}"
+          python3 bin/check-committed-env.py \
+            --diff "origin/${{ github.base_ref }}...HEAD" --read-from HEAD
+
+      # A PR-only guard is decoration in a repo that does not receive PRs, and
+      # some of the repos carrying committed credentials are exactly that --
+      # dormant, no PR flow, commits arriving by direct push if they arrive at
+      # all. So the pushed range is checked too, or the guard would sit green
+      # over the one path those repos actually use.
+      #
+      # `github.event.before` is all-zeros for a branch's first push and is
+      # rewritten by a force push, in which case the range cannot be resolved.
+      # That case falls back to the single head commit rather than silently
+      # checking nothing -- an unresolvable range must never read as clean.
+      - name: Check files this push adds or modifies
+        if: github.event_name == 'push'
+        run: |
+          BEFORE="${{ github.event.before }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "[guard] base $BEFORE unresolvable; falling back to HEAD~1..HEAD"
+            BEFORE="$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+          fi
+          if [ -z "$BEFORE" ]; then
+            echo "[guard] no resolvable base for this push -- checking HEAD's own files"
+            python3 bin/check-committed-env.py \
+              --diff "$(git rev-parse HEAD)" --read-from HEAD
+          else
+            python3 bin/check-committed-env.py \
+              --diff "$BEFORE..${{ github.sha }}" --read-from "${{ github.sha }}"
+          fi

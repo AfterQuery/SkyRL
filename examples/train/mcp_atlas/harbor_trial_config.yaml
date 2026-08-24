@@ -41,7 +41,7 @@ agent:
     # here: it rewrites earlier turns, and step-wise RL needs each turn's prompt to remain
     # a prefix-extension of the previous one.
     max_steps: 80
-    tool_output_cap: 4000
+    tool_output_cap: 40000
     max_tokens: 8192
 
     # The context cap. Keep in sync with

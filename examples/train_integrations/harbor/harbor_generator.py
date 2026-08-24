@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 from copy import deepcopy
@@ -33,6 +34,17 @@ logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 # We have N retries for each trial, if one of the rollout (out of n_samples_per_prompt) fails
 # after N attemptes, we skip this prompt altogether.
 MAX_NUM_RETRIES_PER_TRIAL = 2
+
+# Hard wall-clock cap on a single trial.run(). Harbor's own timeouts cover the agent,
+# verifier, and setup phases -- but NOT artifact collection or teardown, and a docker exec
+# that wedges there hangs the await forever. Measured cost of that gap: one hung trial
+# (a collection exec at 255/256 of a batch) froze a sync run for 12+ hours with healthy
+# engines at 0% utilization. The cap must exceed any legitimate trial: environment setup
+# (<=600s gateway wait) + agent (deadline_sec 1500 / override_timeout_sec 1800) + verifier
+# (minutes) + collection (seconds); observed p100 trial duration is ~1300s. On expiry the
+# trajectory is loss-masked and NOT retried -- a retry would gamble another full window
+# while, in sync training, the whole batch waits.
+TRIAL_RUN_TIMEOUT_S = int(os.environ.get("HARBOR_TRIAL_RUN_TIMEOUT_S", "3600"))
 
 
 @dataclass
@@ -408,6 +420,7 @@ class HarborGenerator(GeneratorInterface):
         successful = False
         is_context_length_error = False
         is_agent_timeout_error = False
+        is_trial_hang = False
 
         for i in range(MAX_NUM_RETRIES_PER_TRIAL):
             prefix = f"Trajectory {trajectory_id} attempt {i+1}/{MAX_NUM_RETRIES_PER_TRIAL}"
@@ -432,7 +445,11 @@ class HarborGenerator(GeneratorInterface):
                 trial = await Trial.create(trial_config)
 
                 async with self._rate_limiter:
-                    results = await trial.run()
+                    # The timeout wraps only trial.run(), with the concurrency slot already
+                    # held: waiting for a slot is legitimate queueing (the second wave of a
+                    # 256-trial batch waits ~20 min at MAX_CONCURRENCY=128) and must not
+                    # count against the trial.
+                    results = await asyncio.wait_for(trial.run(), timeout=TRIAL_RUN_TIMEOUT_S)
 
                 # Parse exception type
                 exc_type = results.exception_info.exception_type if results.exception_info else None
@@ -479,6 +496,19 @@ class HarborGenerator(GeneratorInterface):
                     break
                 else:
                     logger.warning(f"{prefix} failed: empty/missing rollout_details. Results: {results}")
+            except (asyncio.TimeoutError, TimeoutError):
+                # Must precede the generic handler, whose `continue` would retry and gamble
+                # another full TRIAL_RUN_TIMEOUT_S while (in sync training) the entire batch
+                # waits. wait_for has already cancelled the trial task; its container, if
+                # any survives, is left for the age-based orphan cleanup.
+                is_trial_hang = True
+                logger.error(
+                    f"{prefix} hung: trial.run() exceeded {TRIAL_RUN_TIMEOUT_S}s "
+                    f"(HARBOR_TRIAL_RUN_TIMEOUT_S). Loss-masking this trajectory, no retry. "
+                    f"Harbor phase timeouts do not cover artifact collection/teardown, so a "
+                    f"wedged docker exec there is the usual cause."
+                )
+                break
             except Exception as e:
                 logger.warning(f"{prefix} failed: Error running trial: {e}. Results: {results}")
                 continue
@@ -486,7 +516,12 @@ class HarborGenerator(GeneratorInterface):
                 await self.inference_engine_client.finish_session(session_id)
 
         if not successful:
-            stop_reason = "agent_timeout" if is_agent_timeout_error else "error"
+            if is_trial_hang:
+                stop_reason = "trial_timeout"
+            elif is_agent_timeout_error:
+                stop_reason = "agent_timeout"
+            else:
+                stop_reason = "error"
             error_message = f"Trajectory {trajectory_id} failed (stop_reason={stop_reason}), will set loss mask to [0]."
             if stop_reason == "error":
                 error_message += f" Results: {results}"

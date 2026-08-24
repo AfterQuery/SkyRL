@@ -1,11 +1,14 @@
 set -ex
 
-# GRPO on MCP-Atlas through Harbor. Mirrors train_integrations/harbor/run_codecontest.sh;
-# the differences are called out inline.
+# GRPO on MCP-Atlas through Harbor. Mirrors train_integrations/harbor/
+# run_codecontest_fully_async.sh; the differences are called out inline.
 #
-# Synchronous training (colocate_all=true): policy and inference share all 8 GPUs and take
-# turns. For the fully-async variant (2 steps off-policy, split GPU placement), use
-# run_mcp_atlas_harbor_async.sh instead.
+# Fully-async training: FullyAsyncRayPPOTrainer asserts `not colocate_all`, so the node is
+# split into 4 policy + 4 inference GPUs. Generation streams continuously; a trajectory may
+# have been sampled up to MAX_STALENESS_STEPS policy updates before the one that trains on it.
+# This buys wall-clock (no generate/train turn-taking, and MCP-Atlas trials are long-tailed:
+# container boot + up to 80 tool steps) at the cost of off-policy-ness, which the rollout_is
+# loss + geometric sequence masking below correct for.
 
 #-----------------------
 # Prerequisites
@@ -41,8 +44,10 @@ TRAIN_DATA="['$HOME/data/mcp_atlas_train']"
 #-----------------------
 # Directory setup
 #-----------------------
-RUN_NAME="mcp_atlas_harbor"
-STORAGE_ROOT="$HOME/mcp_atlas_harbor_run"
+# New name and storage root: keeps the async run's trials/ckpts/wandb history separate from
+# the finished sync run in ~/mcp_atlas_harbor_run.
+RUN_NAME="mcp_atlas_harbor_async"
+STORAGE_ROOT="$HOME/${RUN_NAME}_run"
 TRIALS_DIR="$STORAGE_ROOT/trials_run"
 CKPTS_DIR="$STORAGE_ROOT/ckpts"
 EXPORTS_DIR="$STORAGE_ROOT/exports"
@@ -93,16 +98,35 @@ APPLY_OVERLONG_FILTERING=true
 # training to be able to merge more step-wise outputs and hence speed up training.
 CHAT_TEMPLATE_PATH="$(dirname "$0")/../../../skyrl/train/utils/templates/qwen3_acc_thinking.jinja2"
 
-# TIS corrections
-TIS_TYPE=token
-TIS_IMP_RATIO_CAP=2.0
+# Off-policy correction, as in run_codecontest_fully_async.sh. With 2-step staleness the
+# rollout policy genuinely lags the trained policy, so the sync setup's token-TIS cap is
+# replaced by the combination tuned for the fully-async trainer:
+#   - policy_loss_type=rollout_is: the GLM-5 agentic loss -- anchors the IS ratio on the
+#     rollout logprobs, so it corrects the staleness gap AND the vLLM-vs-FSDP numerics gap
+#     that token-TIS was covering in the sync run. Do not also set tis_ratio_type: that
+#     would double-count the same gap.
+#   - geometric sequence masking: drops whole sequences whose cumulative IS ratio drifted
+#     outside the band. 0.99-1.01 is the tuned-for-dense default; the config notes MoE models
+#     may need a wider band, so if wandb shows a large masked-sequence fraction, widen to
+#     ~0.98-1.02 before blaming the data.
+SEQUENCE_MASK_METRIC=geometric
+GEO_MASK_HIGH=1.01
+GEO_MASK_LOW=0.99
 
-# LR schedule: linear warmup to LR, then constant. The HF scheduler always ramps from 0, so
-# the "starting LR" is set implicitly by the step count: first update = LR / WARMUP_STEPS.
-# 3e-5 / 30 = 1e-6 -- i.e. the run starts at the old constant LR and takes ~1 epoch
-# (1000 tasks / 32 = ~31 steps) to reach the new peak. Warmup counts optimizer steps.
-LR=1.0e-4
-WARMUP_STEPS=30
+# Fully-async knobs. 2 steps off-policy: a trajectory generated under policy version i may
+# train policy version j only if j - i <= 2. Constraint enforced by the trainer:
+#   mini_batch_size <= num_parallel_generation_workers <= mini_batch_size * (staleness + 1)
+# i.e. 32 <= 64 <= 96 here.
+MAX_STALENESS_STEPS=2
+NUM_PARALLEL_GENERATION_WORKERS=$(( MINI_BATCH_SIZE * 2 ))
+
+# LR warmup, in optimizer (mini-batch) steps; the default scheduler is already
+# constant_with_warmup, so this is the only knob needed. One pass over the 1000 tasks is
+# ~31 steps at batch 32. Warmup matters more under fully-async than sync: the first policy
+# updates land while 64 worker groups are mid-generation, so a hard first step immediately
+# widens the policy/rollout gap, which the geo mask then punishes by dropping sequences.
+# Ramping over ~a third of an epoch keeps early updates small until the pipeline is primed.
+WARMUP_STEPS=15
 
 # LoRA, matching the SFT warm start so RL continues from the same adapter shape. A 30B MoE
 # full-finetune would also need optimizer state for 128 experts x 48 layers; attention-only
@@ -114,11 +138,14 @@ LORA_TARGETS="[q_proj,k_proj,v_proj,o_proj]"
 #----------------
 # Infrastructure setup
 #----------------
-NUM_POLICY_GPUS=8
-NUM_INFERENCE_ENGINES=4
+# Non-colocated split of the 8-GPU node: 4 policy + 4 inference (2 engines x TP2). Half the
+# sync setup's inference capacity, but the engines now generate continuously instead of
+# sitting idle during training steps.
+NUM_POLICY_GPUS=4
+NUM_INFERENCE_ENGINES=2
 TP_SIZE=2
 ENABLE_RATE_LIMITING=true
-TRAJECTORIES_PER_SECOND=10
+TRAJECTORIES_PER_SECOND=5
 # Below run_codecontest.sh's 512 because that runs on Daytona, where a trial is a cloud
 # sandbox; here each trial is a local container running Postgres plus the simulated services.
 #
@@ -127,8 +154,9 @@ TRAJECTORIES_PER_SECOND=10
 # This was briefly halved to 32 while diagnosing AgentSetupTimeoutError, which turned out to
 # be the substitute image failing to seed 234 tasks rather than contention.
 #
-# MINI_BATCH_SIZE * N_SAMPLES_PER_PROMPT = 256 trials are wanted per step either way; this
-# only sets how many run at once.
+# Under fully-async the demand is NUM_PARALLEL_GENERATION_WORKERS groups x
+# N_SAMPLES_PER_PROMPT = 512 in-flight trials at peak; this caps how many containers
+# actually run at once, and 128 is the measured comfortable ceiling for this host.
 MAX_CONCURRENCY=128
 
 # Harbor trial config, with trials_dir pointed at this run's storage.
@@ -165,7 +193,7 @@ print(json.dumps(escape(cfg)))
 # talks to this endpoint directly, so it reads native `tool_calls`; vLLM also rejects a
 # request carrying `tools=` under the default tool_choice="auto" unless both flags are set.
 uv run --isolated --extra fsdp --extra harbor --env-file "$ENV_FILE" \
-  -m examples.train_integrations.harbor.entrypoints.main_harbor \
+  -m examples.train_integrations.harbor.entrypoints.main_harbor_fully_async \
   data.train_data="$TRAIN_DATA" \
   trainer.policy.model.path="$MODEL_PATH" \
   generator.inference_engine.served_model_name=$SERVED_MODEL_NAME \
@@ -173,16 +201,22 @@ uv run --isolated --extra fsdp --extra harbor --env-file "$ENV_FILE" \
   trainer.export_path=$EXPORTS_DIR \
   trainer.ckpt_path=$CKPTS_DIR \
   trainer.log_path=$LOG_DIR \
+  trainer.fully_async.enabled=true \
+  trainer.fully_async.max_staleness_steps=$MAX_STALENESS_STEPS \
+  trainer.fully_async.num_parallel_generation_workers=$NUM_PARALLEL_GENERATION_WORKERS \
+  trainer.fully_async.clear_kv_cache_on_weight_sync=false \
+  trainer.algorithm.policy_loss_type="rollout_is" \
   trainer.algorithm.advantage_estimator=grpo \
   trainer.algorithm.loss_reduction=$LOSS_REDUCTION \
   trainer.algorithm.grpo_norm_by_std=$GRPO_NORM_BY_STD \
   trainer.algorithm.use_kl_loss=$USE_KL_LOSS \
-  trainer.algorithm.off_policy_correction.tis_ratio_type=$TIS_TYPE \
-  trainer.algorithm.off_policy_correction.token_tis_ratio_clip_high=$TIS_IMP_RATIO_CAP \
+  trainer.algorithm.off_policy_correction.sequence_mask_metric=$SEQUENCE_MASK_METRIC \
+  trainer.algorithm.off_policy_correction.geo_mask_high=$GEO_MASK_HIGH \
+  trainer.algorithm.off_policy_correction.geo_mask_low=$GEO_MASK_LOW \
   trainer.policy.model.lora.rank=$LORA_RANK \
   trainer.policy.model.lora.alpha=$LORA_ALPHA \
   trainer.policy.model.lora.target_modules="$LORA_TARGETS" \
-  trainer.placement.colocate_all=true \
+  trainer.placement.colocate_all=false \
   trainer.strategy=fsdp \
   trainer.placement.policy_num_nodes=1 \
   trainer.placement.ref_num_nodes=1 \
@@ -206,18 +240,18 @@ uv run --isolated --extra fsdp --extra harbor --env-file "$ENV_FILE" \
   trainer.max_ckpts_to_keep=5 \
   trainer.hf_save_interval=5 \
   trainer.algorithm.max_seq_len=$MAX_MODEL_LEN \
-  trainer.policy.optimizer_config.lr=$LR \
+  trainer.policy.optimizer_config.lr=1.0e-4 \
   trainer.policy.optimizer_config.num_warmup_steps=$WARMUP_STEPS \
   trainer.policy.optimizer_config.scheduler=constant_with_warmup \
   generator.step_wise_trajectories=true \
   generator.merge_stepwise_output=true \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   generator.apply_overlong_filtering=$APPLY_OVERLONG_FILTERING \
-  generator.inference_engine.gpu_memory_utilization=0.8 \
+  generator.inference_engine.gpu_memory_utilization=0.9 \
   trainer.logger=wandb \
   trainer.project_name=mcp_atlas_harbor \
   trainer.run_name=$RUN_NAME \
-  trainer.resume_mode=latest \
+  trainer.resume_mode=null \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \

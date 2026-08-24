@@ -46,16 +46,17 @@ EXPORT_PATH="$STORAGE_ROOT/hf_exports"
 #-----------------------
 # Training setup
 #-----------------------
-# Sequence length: measured over all 531 rows the max is 28558 tokens, so 32768 keeps every
-# trajectory whole. Rows above max_length are truncated from the end, which would amputate the
-# final answer -- the single most valuable training target -- so do not lower this without
-# re-checking the prep script's length report.
+# Sequence length: measured over the 902 rows of the served-menu dataset the max is 31477
+# tokens, so 32768 keeps every trajectory whole. Rows above max_length are truncated from the
+# end, which would amputate the final answer -- the single most valuable training target -- so
+# do not lower this without re-checking the prep script's length report. (The prep script
+# already dropped 23 rows that exceeded 32768; nothing here is silently truncated.)
 MAX_LENGTH=32768
 
-# With --min-coverage 1.0 --one-per-task the dataset is 505 train rows, so at batch_size 32
-# that is ~15 steps/epoch (~31 steps for 2 epochs). SAVE_INTERVAL/eval_interval above that
-# total means the only checkpoint is the final one -- set it to ~15 to land on epoch
-# boundaries, or leave it high to save just once at the end.
+# With --min-coverage 0.001 --one-per-task the dataset is 902 train rows, so at batch_size 32
+# that is 29 steps/epoch (58 steps for 2 epochs). SAVE_INTERVAL=29 lands on epoch boundaries,
+# giving one checkpoint per epoch -- worth having, since 2 epochs on 902 rows has not been
+# shown not to overfit. The final step is always saved regardless.
 NUM_EPOCHS=2
 BATCH_SIZE=32
 MICRO_BATCH_PER_GPU=1

@@ -28,10 +28,19 @@ three things versus the earlier trajectories-only bundle:
    thinking to another (measured: only 105 of 400 rollouts have equal counts).
 
 Tool JSON schemas are **not** shipped in the bundle (they live in the ``mcp-atlas-runtime``
-image), so parameter schemas are reconstructed from the argument keys the teacher actually
-used, unioned per tool name. Every tool in the task's ``enabled_tools`` is included --
-including distractors the teacher never called, which get an empty parameter object --
-because the teacher chose among the full list and the student should face the same choice.
+image), so ``--tool-schemas`` supplies them from a dump of the gateway's ``/list-tools``. That
+dump does double duty: it carries the schemas, and its key order -- harvested with every service
+enabled -- is the gateway's own tool order, which is what makes each task's menu reproducible
+offline. It is required; there is no reconstruction fallback.
+
+The **menu** -- which tools a row offers -- is built the way RL builds it: every tool of every
+service in the task's ``AQ_SIM_ENABLED_SERVERS``, in the gateway's own order. It is emphatically
+not ``task.toml``'s ``enabled_tools``, which is a curated subset. The teacher ran through this
+repo's ``mcp-atlas`` agent against the same gateway, so it chose from the served menu, and
+56% of teacher rollouts call a tool ``enabled_tools`` omits. Building rows against the curated
+list therefore produced targets calling tools the row never offered -- 45% of rows, 12% of
+calls -- training the student that the menu does not constrain it. ``--max-off-menu-row-fraction``
+guards the repair.
 
 Usage::
 
@@ -51,33 +60,48 @@ import argparse
 import collections
 import json
 import random
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-_JSON_TYPE = {
-    str: "string",
-    bool: "boolean",
-    int: "integer",
-    float: "number",
-    list: "array",
-    dict: "object",
-}
+def _parse_enabled_services(dockerfile_text: str) -> List[str]:
+    """The task's ``AQ_SIM_ENABLED_SERVERS``, which is what the gateway actually serves."""
+    match = re.search(r'AQ_SIM_ENABLED_SERVERS="([^"]+)"', dockerfile_text)
+    if not match:
+        return []
+    return [s.strip() for s in match.group(1).split(",") if s.strip()]
 
 
-def _parse_toml_string_list(text: str, key: str) -> List[str]:
-    """Extract a TOML array-of-strings value without a TOML dependency.
+def _service_of(tool: str, services: List[str]) -> Optional[str]:
+    """Owning service for a tool name, longest prefix first.
 
-    task.toml is machine-generated with one quoted entry per line, so a bracket scan is
-    sufficient and avoids adding tomli/tomllib version handling.
+    Longest-prefix matters: 'google_calendar' and 'google_forms' would both lose to a bare
+    'google' prefix, and 'ddg-search'/'open-library' carry hyphens inside the service name.
     """
-    start = text.find(f"{key} = [")
-    if start == -1:
+    candidates = [s for s in services if tool.startswith(s + "_")]
+    return max(candidates, key=len) if candidates else None
+
+
+def served_tool_schemas(
+    dockerfile_text: str, real_schemas: Dict[str, Dict[str, Any]], services: List[str]
+) -> List[Dict[str, Any]]:
+    """The tools RL serves for a task: every tool of its enabled services, gateway order.
+
+    The runner does not filter -- it offers whatever ``/list-tools`` returns (see
+    ``mcp_atlas_runner.py``), and the gateway serves the full surface of every service in
+    ``AQ_SIM_ENABLED_SERVERS``. ``real_schemas`` was dumped from that same endpoint with all
+    services enabled, so its key order *is* the gateway's ordering and filtering it preserves
+    both the set and the order. That is also why this returns schemas rather than names: the
+    menu is a subset of the dump, so there is nothing to look up afterwards and no tool can
+    be missing a schema.
+
+    Verified against ``rollout.prompt_token_ids`` from 512 live RL rollouts: exact name-set
+    match 512/512 and exact order match 512/512.
+    """
+    enabled = set(_parse_enabled_services(dockerfile_text))
+    if not enabled:
         return []
-    end = text.find("]", start)
-    if end == -1:
-        return []
-    body = text[start + len(f"{key} = [") : end]
-    return [part.strip().strip('",').strip('"') for part in body.split("\n") if part.strip().strip(",").strip()]
+    return [s for name, s in real_schemas.items() if _service_of(name, services) in enabled]
 
 
 def _tool_content(raw: Any) -> str:
@@ -165,47 +189,6 @@ def convert_messages(
     return out, dangling
 
 
-def build_tool_schemas(
-    enabled_tools: List[str],
-    real_schemas: Dict[str, Dict[str, Any]],
-    observed_args: Dict[str, Dict[str, str]],
-    fallback_used: Optional[Set[str]] = None,
-) -> List[Dict[str, Any]]:
-    """OpenAI function schemas for a task's enabled tools, real ones wherever available.
-
-    The schema block is roughly a third of the prompt, and RL serves whatever the container
-    gateway reports, so a reconstructed stub here is a large train/serve mismatch. It is also
-    a mismatch with the teacher: GLM ran through the same runner against the same gateway, so
-    its choices were conditioned on the real descriptions and on ``required`` / ``default``.
-    Measured consequence of getting this wrong: reasoning transferred from SFT (3% -> 100% of
-    turns) while tool-calling did not (70% -> 68% of rollouts made no call at all).
-
-    ``observed_args`` remains only as a fallback for a tool with no served schema, so a gap in
-    the dump degrades one tool rather than failing the run; fallbacks are counted by the
-    caller so they cannot pass unnoticed.
-    """
-    schemas = []
-    for name in enabled_tools:
-        real = real_schemas.get(name)
-        if real is not None:
-            schemas.append(real)
-            continue
-        if fallback_used is not None:
-            fallback_used.add(name)
-        props = {k: {"type": t} for k, t in sorted(observed_args.get(name, {}).items())}
-        schemas.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": f"MCP tool {name}.",
-                    "parameters": {"type": "object", "properties": props},
-                },
-            }
-        )
-    return schemas
-
-
 def pretokenize_row(
     messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], tokenizer, chat_template: Optional[str]
 ) -> Optional[Dict[str, Any]]:
@@ -265,6 +248,14 @@ def main() -> None:
         "sets pass_threshold=0.85 (the earlier bundle used 0.75).",
     )
     parser.add_argument(
+        "--max-off-menu-row-fraction",
+        type=float,
+        default=0.05,
+        help="Fail if more than this fraction of emitted rows call a tool absent from their own "
+        "tools block. With the served menu the residue is teacher typos only (~1%% of rollouts); "
+        "the curated task.toml menu scored 45%%, which is the regression this guards against.",
+    )
+    parser.add_argument(
         "--one-per-task",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -294,10 +285,9 @@ def main() -> None:
         "--tool-schemas",
         type=Path,
         default=Path("~/data/mcp_atlas_tool_schemas.json"),
-        help="JSON of real tool schemas from dump_tool_schemas.py. These are what RL serves "
-        "and what the teacher saw, so training on reconstructed stubs instead is a "
-        "train/serve mismatch across a third of the prompt. Pass '' to fall back to schemas "
-        "reconstructed from teacher usage (not recommended).",
+        help="JSON of real tool schemas from dump_tool_schemas.py, dumped from the runtime "
+        "image's /list-tools. Required: it supplies the schemas RL serves, and its key order "
+        "supplies each task's menu and that menu's order.",
     )
     parser.add_argument(
         "--max-length",
@@ -432,36 +422,59 @@ def main() -> None:
     if unusable:
         print(f"  rejected: {dict(unusable.most_common())}")
 
-    real_schemas: Dict[str, Dict[str, Any]] = {}
-    if args.tool_schemas and str(args.tool_schemas):
-        schema_path = Path(str(args.tool_schemas)).expanduser()
-        if not schema_path.is_file():
-            raise SystemExit(
-                f"{schema_path} not found. Generate it with:\n"
-                f"  uv run examples/train/mcp_atlas/dump_tool_schemas.py "
-                f"--tasks-dir <tasks> --output {schema_path}\n"
-                "Or pass --tool-schemas '' to reconstruct from teacher usage instead."
-            )
-        payload = json.loads(schema_path.read_text())
-        real_schemas = payload.get("schemas") or {}
-        print(f"Loaded {len(real_schemas)} real tool schemas from {schema_path} (image {payload.get('image')})")
-    else:
-        print("WARNING: no --tool-schemas; schemas will be reconstructed from teacher usage "
-              "and will not match what RL serves")
+    # The dump is required, not optional: it supplies both the schemas and -- through its key
+    # order -- the menu and the menu's order. There is nothing to fall back to.
+    schema_path = Path(str(args.tool_schemas)).expanduser()
+    if not schema_path.is_file():
+        raise SystemExit(
+            f"{schema_path} not found. Generate it with:\n"
+            f"  uv run examples/train/mcp_atlas/dump_tool_schemas.py "
+            f"--tasks-dir <tasks> --output {schema_path}"
+        )
+    payload = json.loads(schema_path.read_text())
+    real_schemas: Dict[str, Dict[str, Any]] = payload.get("schemas") or {}
+    dump_services: List[str] = payload.get("services") or []
+    dump_image = payload.get("image")
+    if not real_schemas or not dump_services:
+        raise SystemExit(f"{schema_path} has no schemas/services; regenerate it")
+    print(f"Loaded {len(real_schemas)} real tool schemas from {schema_path} (image {dump_image})")
 
-    # 2. Load each task's enabled_tools (includes distractors the teacher had to reject).
-    enabled_by_task: Dict[str, List[str]] = {}
+    # 2. Build each task's tool menu the way RL builds it: every tool of every service in the
+    #    task's AQ_SIM_ENABLED_SERVERS, in the gateway's own order.
+    #
+    #    NOT task.toml's enabled_tools. That is a curated subset, and using it made the dataset
+    #    internally inconsistent, because the teacher ran against the same gateway and so chose
+    #    from the wider menu: 1667/2982 teacher rollouts (56%) call a tool absent from
+    #    enabled_tools, which left 45% of emitted rows demonstrating a call to a tool their own
+    #    <tools> block never offered. Measured menu sizes: enabled_tools mean 15.6, served mean
+    #    32.4 (max 150), with the served menu strictly larger for 959/1000 tasks.
+    #    The served path yields schemas directly. Only the degraded path below needs a list of
+    #    names, because there a name may have no served schema and must be reconstructed.
+    served_by_task: Dict[str, List[Dict[str, Any]]] = {}
     for task_id in {t for t, _, _, _, _ in selected}:
-        toml_path = tasks_dir / "tasks" / task_id / "task.toml"
-        if not toml_path.is_file():
-            continue
-        enabled_by_task[task_id] = _parse_toml_string_list(toml_path.read_text(), "enabled_tools")
-    missing_tasks = [t for t, _, _, _, _ in selected if t not in enabled_by_task]
-    if missing_tasks:
-        print(f"WARNING: {len(set(missing_tasks))} tasks missing task.toml; their rows get tools=[]")
+        dockerfile = tasks_dir / "tasks" / task_id / "environment" / "Dockerfile"
+        # No fallback. A row whose menu is not the served menu is the defect this replaced, and
+        # falling back would reintroduce it silently for the affected tasks. Verified reachable
+        # for the whole set: across all 1000 tasks there are no missing Dockerfiles, no
+        # unparsable AQ_SIM_ENABLED_SERVERS, no services absent from the dump, and no empty
+        # menus -- so this raising is a real invariant, not an unhandled case.
+        if not dockerfile.is_file():
+            raise SystemExit(f"{task_id}: no environment/Dockerfile, cannot determine served tools")
+        schemas = served_tool_schemas(dockerfile.read_text(), real_schemas, dump_services)
+        if not schemas:
+            raise SystemExit(
+                f"{task_id}: empty served menu. Either AQ_SIM_ENABLED_SERVERS is missing from its "
+                f"Dockerfile, or its services are absent from {args.tool_schemas} (dumped from "
+                f"image {dump_image})."
+            )
+        served_by_task[task_id] = schemas
+    sizes = sorted(len(v) for v in served_by_task.values())
+    print(
+        f"Tool menu per task: mean {sum(sizes)/len(sizes):.1f}, median {sizes[len(sizes)//2]}, "
+        f"max {sizes[-1]} (served menu, matching RL)"
+    )
 
-    # 3. Pass one: normalise transcripts and collect observed argument types per tool name.
-    observed_args: Dict[str, Dict[str, str]] = collections.defaultdict(dict)
+    # 3. Pass one: normalise transcripts.
     converted: List[tuple] = []
     total_dangling = 0
     skipped = 0
@@ -482,43 +495,66 @@ def main() -> None:
             continue
         if reasoning:
             with_reasoning += 1
-        # trajectory.tool_calls records arguments as a dict (the runner parsed them), which is
-        # what the schema reconstruction needs; the copies inside messages are JSON strings.
-        for call in traj.get("tool_calls") or []:
-            name, call_args = call.get("name"), call.get("arguments")
-            if not name or not isinstance(call_args, dict):
-                continue
-            for key, value in call_args.items():
-                observed_args[name].setdefault(key, _JSON_TYPE.get(type(value), "string"))
         converted.append((task_id, run, coverage, messages))
 
     print(f"Converted {len(converted)} rollouts (skipped {skipped}); {total_dangling} tool messages answered no known call")
     if args.inject_reasoning:
         print(f"Injected teacher reasoning into {with_reasoning}/{len(converted)} rollouts")
-    print(f"Reconstructed parameter schemas for {len(observed_args)} distinct tools from teacher usage")
 
     # 4. Pass two: attach per-task tool schemas and emit rows.
     out_rows = []
-    fallback_used: Set[str] = set()
+    off_menu_rows = 0
+    off_menu_calls = 0
+    total_calls = 0
+    off_menu_names: collections.Counter = collections.Counter()
     for task_id, run, coverage, messages in converted:
-        enabled = enabled_by_task.get(task_id, [])
+        tools = served_by_task[task_id]
+        # A target that calls a tool the row never offered teaches the student that the menu
+        # does not constrain it. This is the defect the served menu fixes, so it is measured
+        # on the emitted rows rather than assumed away.
+        menu = {t["function"]["name"] for t in tools}
+        called = [
+            (call.get("function") or {}).get("name")
+            for message in messages
+            if message.get("role") == "assistant"
+            for call in (message.get("tool_calls") or [])
+        ]
+        called = [c for c in called if c]
+        off = [c for c in called if c not in menu]
+        total_calls += len(called)
+        off_menu_calls += len(off)
+        if off:
+            off_menu_rows += 1
+            off_menu_names.update(off)
         out_rows.append(
             {
                 "messages": messages,
-                "tools": json.dumps(
-                    build_tool_schemas(enabled, real_schemas, observed_args, fallback_used)
-                ),
+                "tools": json.dumps(tools),
                 "task_id": task_id,
                 "run_index": run,
                 "coverage": coverage,
             }
         )
 
-    if fallback_used:
-        print(
-            f"WARNING: {len(fallback_used)} tools had no served schema and fell back to "
-            f"reconstruction: {sorted(fallback_used)[:8]}"
+    pct_rows = off_menu_rows / len(out_rows) if out_rows else 0.0
+    print(
+        f"Off-menu calls (target calls a tool absent from its own tools block): "
+        f"{off_menu_rows}/{len(out_rows)} rows ({pct_rows:.0%}), "
+        f"{off_menu_calls}/{total_calls} calls"
+    )
+    if off_menu_names:
+        # With the served menu the only residue should be teacher typos -- names no service
+        # ever exposed (e.g. 'calculator_calcalculate', 'google-calendar_list_events' for the
+        # real 'google_calendar_list_events'). Anything beyond a trickle means the menu is
+        # being built wrong again, so it is a hard failure rather than a warning.
+        print(f"  off-menu names: {off_menu_names.most_common(8)}")
+        assert pct_rows <= args.max_off_menu_row_fraction, (
+            f"{pct_rows:.0%} of rows call an off-menu tool, above "
+            f"--max-off-menu-row-fraction {args.max_off_menu_row_fraction:.0%}. The tool menu "
+            f"almost certainly does not match what RL serves. Worst offenders: "
+            f"{off_menu_names.most_common(5)}"
         )
+
     rng = random.Random(args.seed)
     rng.shuffle(out_rows)
 

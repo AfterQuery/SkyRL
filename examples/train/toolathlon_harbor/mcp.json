@@ -1,0 +1,9 @@
+{
+  "mcp_servers": {
+    "toolathlon": {
+      "transport": "stdio",
+      "command": "python",
+      "args": ["-m", "t3.mcp_server"]
+    }
+  }
+}

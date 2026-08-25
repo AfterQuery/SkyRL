@@ -1,0 +1,39 @@
+# Harbor TrialConfig for SkyRL generation/training on the JSON-world
+# Toolathlon delivery. SkyRL injects task.path, agent.model_name, api_base, and
+# session_id for each trajectory.
+trials_dir: ~/trials/toolathlon
+
+agent:
+  # Clear the generic Harbor default before selecting a custom import-path agent.
+  name: null
+  import_path: examples.train_integrations.harbor.mcp_agent:HarborMCPAgent
+  override_timeout_sec: 7200
+  mcp_servers:
+    - name: toolathlon
+      transport: stdio
+      command: python
+      args: ["-m", "t3.mcp_server"]
+  env:
+    OPENAI_API_KEY: "${TOOLATHLON_API_KEY:-dummy}"
+  kwargs:
+    max_turns: 64
+    deadline_sec: 7000
+    request_timeout_sec: 900
+    max_tokens: 8192
+    temperature: 1.0
+    collect_rollout_details: true
+    strict_rollout_details: true
+
+environment:
+  type: docker
+  force_build: false
+  delete: true
+  # Clear the defaults merged by main_harbor so task.toml remains authoritative.
+  override_cpus: null
+  override_memory_mb: null
+  override_storage_mb: null
+  kwargs:
+    auto_stop_interval_mins: null
+
+verifier:
+  disable: false

@@ -4,8 +4,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
 
-TASKS_DIR="${TOOLATHLON_TASKS_DIR:-$REPO_ROOT/toolathlon-tasks/tasks/tasks}"
-RUNTIME_ARCHIVE="${TOOLATHLON_RUNTIME_ARCHIVE:-$REPO_ROOT/toolathlon-tasks/tasks/runtime/toolathlon-json-runtime-src.tar.gz}"
+TASKS_DIR="${TOOLATHLON_TASKS_DIR:-$REPO_ROOT/toolathlon-tasks/tasks}"
+RUNTIME_ARCHIVE="${TOOLATHLON_RUNTIME_ARCHIVE:-$REPO_ROOT/toolathlon-tasks/runtime/toolathlon-json-runtime-src.tar.gz}"
 RUNTIME_IMAGE="${TOOLATHLON_RUNTIME_IMAGE:-toolathlon-json-runtime:v1}"
 API_BASE="${TOOLATHLON_API_BASE:?Set TOOLATHLON_API_BASE to an OpenAI-compatible /v1 endpoint}"
 API_KEY="${TOOLATHLON_API_KEY:-dummy}"
@@ -24,7 +24,7 @@ if ! docker image inspect "$RUNTIME_IMAGE" >/dev/null 2>&1; then
   BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/toolathlon-runtime.XXXXXX")"
   trap 'rm -rf -- "$BUILD_DIR"' EXIT
   tar xzf "$RUNTIME_ARCHIVE" -C "$BUILD_DIR" --strip-components=1
-  docker build -t "$RUNTIME_IMAGE" "$BUILD_DIR"
+  docker buildx build --platform linux/amd64 --load -t "$RUNTIME_IMAGE" "$BUILD_DIR"
 fi
 
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"

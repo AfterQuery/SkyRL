@@ -320,14 +320,9 @@ torchvision = [
     { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
 ]
-# AfterQuery's Harbor fork: carries the mcp-atlas agent and adapter used by
-# examples/train/mcp_atlas. Bump this rev when landing commits on that fork's aq branch.
-# Local checkout: the commits this integration needs are ahead of what has been pushed
-# (no working GitHub credential on this host -- the VS Code credential socket git is
-# configured against is stale). Restore a git pin once they are pushed:
-#   harbor = { git = "https://github.com/AfterQuery/harbor-aq", rev = "<sha>" }
-# Local HEAD at time of writing: 6202299 (sandbox lifecycle logging).
-harbor = { path = "/home/ubuntu/harbor", editable = true }
+# AfterQuery's Harbor fork carries the RL rollout extensions and existing
+# raw-HTTP Compute provider used by the training integrations in this repository.
+harbor = { git = "ssh://git@github.com/AfterQuery/harbor-aq.git", rev = "2f4d85395373e6001949c38484a20130643497eb" }
 megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev = "91a15142a4b4442a8d46ab539d1b923bd08570d0", marker = "sys_platform == 'linux'"}
 # megatron-core main branch: https://github.com/NVIDIA/Megatron-LM/tree/main latest as of 6/8/26
 megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "71e418ea7d7b3a6c9a53238c543c3e0b43e11026", marker = "sys_platform == 'linux'"}

@@ -1,32 +1,40 @@
-"""Generic OpenAI-compatible agent for Harbor tasks exposing stdio MCP tools."""
+"""Generic host-side OpenAI agent for Harbor tasks exposing stdio MCP tools."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import shlex
 from pathlib import Path, PurePosixPath
 from typing import Any
+from uuid import uuid4
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.trial.paths import EnvironmentPaths
 
+from .mcp_runner import run_loop
+
 
 class HarborMCPAgent(BaseAgent):
-    """Drive configured stdio MCP tools without exposing a shell to the model."""
+    """Run the model locally and dispatch configured stdio MCP tools remotely."""
 
     SUPPORTS_ATIF = False
     _REMOTE_DIR = PurePosixPath("/opt/harbor-mcp-agent")
-    _REMOTE_RUNNER = _REMOTE_DIR / "runner.py"
-    _REMOTE_INSTRUCTION = _REMOTE_DIR / "instruction.md"
-    _TRAJECTORY = EnvironmentPaths.agent_dir / "trajectory.json"
+    _REMOTE_BRIDGE = _REMOTE_DIR / "bridge.py"
+    _REMOTE_SOCKET = _REMOTE_DIR / "bridge.sock"
+    _REMOTE_PID = _REMOTE_DIR / "bridge.pid"
+    _REMOTE_RPC_DIR = _REMOTE_DIR / "rpc"
+    _BRIDGE_LOG = EnvironmentPaths.agent_dir / "bridge.log"
     _MAX_TRAJECTORY_BYTES = 100_000_000
 
     def __init__(
         self,
         api_base: str | None = None,
         api_key: str | None = None,
+        session_id: str | None = None,
         max_turns: int = 64,
         deadline_sec: float = 7000,
         request_timeout_sec: float = 900,
@@ -42,6 +50,7 @@ class HarborMCPAgent(BaseAgent):
         self.extra_env = extra_env or {}
         self.api_base = api_base or self.extra_env.get("OPENAI_BASE_URL")
         self.api_key = api_key or self.extra_env.get("OPENAI_API_KEY", "dummy")
+        self.session_id = session_id
         self.max_turns = max_turns
         self.deadline_sec = deadline_sec
         self.request_timeout_sec = request_timeout_sec
@@ -49,85 +58,216 @@ class HarborMCPAgent(BaseAgent):
         self.temperature = temperature
         self.collect_rollout_details = collect_rollout_details
         self.strict_rollout_details = strict_rollout_details
+        self._bridge_tools: list[dict[str, Any]] = []
         if not self.api_base:
             raise ValueError("HarborMCPAgent requires api_base or OPENAI_BASE_URL")
         if not self.model_name:
             raise ValueError("HarborMCPAgent requires agent.model_name")
         if len(self.mcp_servers) != 1 or self.mcp_servers[0].transport != "stdio":
-            raise ValueError("HarborMCPAgent currently requires exactly one stdio MCP server")
+            raise ValueError(
+                "HarborMCPAgent currently requires exactly one stdio MCP server"
+            )
+        if not self.mcp_servers[0].command:
+            raise ValueError("HarborMCPAgent requires an MCP server command")
 
     @staticmethod
     def name() -> str:
         return "harbor-mcp"
 
     def version(self) -> str | None:
-        return "1"
+        return "2"
 
     def _request_model(self) -> str:
         assert self.model_name is not None
         return self.model_name.split("/", 1)[-1]
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        local_runner = Path(__file__).with_name("mcp_runner.py")
+        local_bridge = Path(__file__).with_name("mcp_bridge.py")
+        directories = [
+            self._REMOTE_DIR.as_posix(),
+            self._REMOTE_RPC_DIR.as_posix(),
+            EnvironmentPaths.agent_dir.as_posix(),
+        ]
         result = await environment.exec(
-            f"mkdir -p {shlex.quote(self._REMOTE_DIR.as_posix())} {shlex.quote(EnvironmentPaths.agent_dir.as_posix())}",
+            "mkdir -p " + " ".join(shlex.quote(path) for path in directories),
             user="root",
             timeout_sec=30,
         )
         if result.return_code != 0:
-            raise RuntimeError(result.stderr or result.stdout or "failed to create MCP agent directory")
-        await environment.upload_file(local_runner, self._REMOTE_RUNNER.as_posix())
-
-    async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
-        local_instruction = self.logs_dir / "instruction.md"
-        local_instruction.write_text(instruction)
-        await environment.upload_file(local_instruction, self._REMOTE_INSTRUCTION.as_posix())
+            raise RuntimeError(
+                result.stderr
+                or result.stdout
+                or "failed to create MCP bridge directory"
+            )
+        await environment.upload_file(local_bridge, self._REMOTE_BRIDGE.as_posix())
 
         server = self.mcp_servers[0]
         command = [
             "python3",
-            self._REMOTE_RUNNER.as_posix(),
-            "--instruction-file",
-            self._REMOTE_INSTRUCTION.as_posix(),
-            "--trajectory-file",
-            self._TRAJECTORY.as_posix(),
+            self._REMOTE_BRIDGE.as_posix(),
+            "serve",
+            "--socket",
+            self._REMOTE_SOCKET.as_posix(),
             "--mcp-command",
             server.command or "",
-            "--model",
-            self._request_model(),
-            "--max-turns",
-            str(self.max_turns),
-            "--deadline",
-            str(self.deadline_sec),
-            "--request-timeout",
-            str(self.request_timeout_sec),
-            "--max-tokens",
-            str(self.max_tokens),
-            "--temperature",
-            str(self.temperature),
         ]
         for arg in server.args:
             command.append(f"--mcp-arg={arg}")
-        if self.collect_rollout_details:
-            command.append("--collect-rollout-details")
-        if self.strict_rollout_details:
-            command.append("--strict-rollout-details")
         shell_command = " ".join(shlex.quote(part) for part in command)
-        result = await environment.exec(
-            f"{shell_command} > {shlex.quote((EnvironmentPaths.agent_dir / 'runner.log').as_posix())} 2>&1",
-            env={"OPENAI_BASE_URL": self.api_base or "", "OPENAI_API_KEY": self.api_key},
-            timeout_sec=int(self.deadline_sec + 60),
+        start = await environment.exec(
+            f"rm -f {shlex.quote(self._REMOTE_SOCKET.as_posix())}; "
+            f"nohup {shell_command} > {shlex.quote(self._BRIDGE_LOG.as_posix())} 2>&1 "
+            f"< /dev/null & echo $! > {shlex.quote(self._REMOTE_PID.as_posix())}",
+            user="root",
+            timeout_sec=30,
         )
-        await self._apply_trajectory(environment, context)
-        if result.return_code != 0:
-            raise RuntimeError(result.stderr or result.stdout or "MCP agent runner failed")
+        if start.return_code != 0:
+            raise RuntimeError(
+                start.stderr or start.stdout or "failed to start MCP bridge"
+            )
 
-    async def _apply_trajectory(self, environment: BaseEnvironment, context: AgentContext) -> None:
+        last_error: Exception | None = None
+        for _ in range(30):
+            try:
+                response = await self._bridge_rpc(
+                    environment, {"op": "list_tools"}, timeout_sec=30
+                )
+                tools = response.get("tools")
+                if not isinstance(tools, list):
+                    raise TypeError("MCP bridge list_tools response omitted tools")
+                self._bridge_tools = tools
+                return
+            except Exception as exc:  # noqa: BLE001 - readiness retries include provider errors
+                last_error = exc
+                await asyncio.sleep(1)
+        raise RuntimeError(f"MCP bridge did not become ready: {last_error}")
+
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
+        trajectory: dict[str, Any] | None = None
+
+        async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            return await self._bridge_rpc(
+                environment,
+                {"op": "call_tool", "name": name, "arguments": arguments},
+                timeout_sec=int(self.request_timeout_sec),
+            )
+
+        async def checkpoint(value: dict[str, Any]) -> None:
+            self._write_trajectory(value)
+            self._apply_trajectory(value, context)
+
+        try:
+            trajectory = await run_loop(
+                instruction=instruction,
+                bridge_tools=self._bridge_tools,
+                call_tool=call_tool,
+                checkpoint=checkpoint,
+                api_base=self.api_base or "",
+                api_key=self.api_key,
+                model=self._request_model(),
+                max_turns=self.max_turns,
+                deadline_sec=self.deadline_sec,
+                request_timeout_sec=self.request_timeout_sec,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+                collect_rollout_details=self.collect_rollout_details,
+                strict_rollout_details=self.strict_rollout_details,
+                session_id=self.session_id,
+            )
+        finally:
+            shutdown = asyncio.create_task(self._shutdown_bridge(environment))
+            try:
+                await asyncio.shield(shutdown)
+            except Exception as exc:  # noqa: BLE001 - preserve cleanup errors in the trajectory
+                if trajectory is not None and not trajectory.get("error"):
+                    trajectory["stop_reason"] = "error"
+                    trajectory["error"] = (
+                        f"bridge shutdown failed: {type(exc).__name__}: {exc}"
+                    )
+                    await checkpoint(trajectory)
+
+        if trajectory and trajectory.get("error"):
+            raise RuntimeError(str(trajectory["error"]))
+
+    async def _shutdown_bridge(self, environment: BaseEnvironment) -> None:
+        await self._bridge_rpc(environment, {"op": "shutdown"}, timeout_sec=30)
+        pid_file = shlex.quote(self._REMOTE_PID.as_posix())
+        wait = await environment.exec(
+            f"pid=$(cat {pid_file}); "
+            'while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done',
+            user="root",
+            timeout_sec=30,
+        )
+        if wait.return_code != 0:
+            raise RuntimeError(
+                wait.stderr or wait.stdout or "MCP bridge did not stop cleanly"
+            )
+
+    async def _bridge_rpc(
+        self,
+        environment: BaseEnvironment,
+        request: dict[str, Any],
+        *,
+        timeout_sec: int,
+    ) -> dict[str, Any]:
+        rpc_id = uuid4().hex
+        local_request = self.logs_dir / f"bridge-request-{rpc_id}.json"
+        local_response = self.logs_dir / f"bridge-response-{rpc_id}.json"
+        remote_request = self._REMOTE_RPC_DIR / f"{rpc_id}.request.json"
+        remote_response = self._REMOTE_RPC_DIR / f"{rpc_id}.response.json"
+        local_request.write_text(json.dumps(request, ensure_ascii=False))
+        try:
+            await environment.upload_file(local_request, remote_request.as_posix())
+            command = " ".join(
+                shlex.quote(part)
+                for part in [
+                    "python3",
+                    self._REMOTE_BRIDGE.as_posix(),
+                    "request",
+                    "--socket",
+                    self._REMOTE_SOCKET.as_posix(),
+                    "--request-file",
+                    remote_request.as_posix(),
+                    "--response-file",
+                    remote_response.as_posix(),
+                ]
+            )
+            result = await environment.exec(
+                command, user="root", timeout_sec=timeout_sec
+            )
+            if result.return_code != 0:
+                raise RuntimeError(
+                    result.stderr or result.stdout or "MCP bridge request failed"
+                )
+            await environment.download_file(remote_response.as_posix(), local_response)
+            if local_response.stat().st_size > self._MAX_TRAJECTORY_BYTES:
+                raise RuntimeError("MCP bridge response exceeds 100 MB")
+            envelope = json.loads(local_response.read_text())
+            if envelope.get("status") != "ok":
+                raise RuntimeError(
+                    str(envelope.get("error") or "MCP bridge returned an error")
+                )
+            payload = envelope.get("result")
+            if not isinstance(payload, dict):
+                raise TypeError("MCP bridge returned an invalid result")
+            return payload
+        finally:
+            local_request.unlink(missing_ok=True)
+            local_response.unlink(missing_ok=True)
+
+    def _write_trajectory(self, trajectory: dict[str, Any]) -> None:
         local = self.logs_dir / "trajectory.json"
-        await environment.download_file(self._TRAJECTORY.as_posix(), local)
-        if local.stat().st_size > self._MAX_TRAJECTORY_BYTES:
+        encoded = json.dumps(trajectory, indent=2, ensure_ascii=False)
+        if len(encoded.encode()) > self._MAX_TRAJECTORY_BYTES:
             raise RuntimeError("MCP trajectory exceeds 100 MB")
-        trajectory = json.loads(local.read_text())
+        temporary = local.with_suffix(".tmp")
+        temporary.write_text(encoded)
+        os.replace(temporary, local)
+
+    @staticmethod
+    def _apply_trajectory(trajectory: dict[str, Any], context: AgentContext) -> None:
         usage = trajectory.get("usage") or {}
         context.n_input_tokens = int(usage.get("prompt_tokens") or 0)
         context.n_output_tokens = int(usage.get("completion_tokens") or 0)

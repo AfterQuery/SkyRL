@@ -2,9 +2,10 @@
 
 This adapter runs the JSON-world Toolathlon delivery through Harbor using the
 generic MCP agent in `examples/train_integrations/harbor/mcp_agent.py`. The
-model receives only the task instruction and the tools discovered from the
-container-local `t3.mcp_server`; Harbor continues to own the Docker lifecycle
-and deterministic verifier.
+model loop runs in the Harbor process and talks directly to the configured
+inference endpoint. Tool actions cross Harbor's environment interface to a
+small bridge that owns the container-local `t3.mcp_server`; Harbor continues
+to own the environment lifecycle and deterministic verifier.
 
 ## Local evaluation
 
@@ -28,6 +29,10 @@ as `--n-concurrent` work normally.
 
 The benchmark's intended prompt contract is preserved: the complete
 `instruction.md` is sent as one user message and no system prompt is added.
+The model endpoint and API key stay on the Harbor host and are not injected
+into the task container. Because tool RPC uses Harbor's file-transfer and exec
+interfaces instead of an exposed container port, the same agent can operate a
+remote Harbor environment once that environment can build the task image.
 
 ## Infrastructure checks
 

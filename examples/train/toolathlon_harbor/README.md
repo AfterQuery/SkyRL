@@ -21,6 +21,10 @@ bash examples/train/toolathlon_harbor/run_eval.sh \
   -i 401k-watchlist-recency-window-refresh
 ```
 
+`run_eval.sh` uses Harbor's local Docker environment by default. Use the
+separate `run_compute_eval.sh` wrapper only when task containers should run on
+AfterQuery Compute.
+
 The default task root is `toolathlon-tasks/tasks`. Override it with
 `TOOLATHLON_TASKS_DIR`. The launcher builds `toolathlon-json-runtime:v1` from
 the bundled runtime archive as `linux/amd64` when the image is missing.
@@ -55,6 +59,10 @@ bash examples/train/toolathlon_harbor/run_compute_eval.sh \
   -i 401k-watchlist-recency-window-refresh
 ```
 
+`run_compute_eval.sh` exits immediately with an explanatory error when
+`COMPUTE_API_KEY` is unset or empty. It defaults `COMPUTE_API_URL` to the
+production endpoint and selects Harbor's Compute environment automatically.
+
 Use `COMPUTE_PROVIDER` to target a dedicated cluster. For pass@k, add
 `--n-attempts K`; combine it with `--n-concurrent N` to control parallelism.
 Registry tokens last approximately 15 minutes, so refresh the login before a
@@ -71,6 +79,23 @@ harbor run --path tasks -i 401k-watchlist-recency-window-refresh --agent nop
 ```
 
 Expect rewards `1.0` and `0.0`, respectively.
+
+To test the same golden path on AfterQuery Compute, authenticate to Artifact
+Registry as above and run:
+
+```bash
+COMPUTE_API_URL=${COMPUTE_API_URL:-https://compute-api.afterquery.com} \
+COMPUTE_IMAGE_REGISTRY=${COMPUTE_IMAGE_REGISTRY:-us-docker.pkg.dev/afterquery-compute/compute-images/} \
+uv run --extra harbor harbor run \
+  --path toolathlon-tasks/tasks \
+  -i 401k-watchlist-recency-window-refresh \
+  --agent oracle \
+  --env compute \
+  --n-concurrent 1
+```
+
+This validates image building, the remote environment lifecycle, solution
+replay, and verification without making a model request.
 
 ## SkyRL generation and training
 

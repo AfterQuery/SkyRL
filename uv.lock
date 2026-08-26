@@ -3033,7 +3033,7 @@ wheels = [
 [[package]]
 name = "harbor"
 version = "0.18.0"
-source = { git = "ssh://git@github.com/AfterQuery/harbor-aq.git?rev=2f4d85395373e6001949c38484a20130643497eb#2f4d85395373e6001949c38484a20130643497eb" }
+source = { git = "ssh://git@github.com/AfterQuery/harbor-aq.git?rev=f2f7a15dc4f05b424a54d865850af6d9b54a9e5c#f2f7a15dc4f05b424a54d865850af6d9b54a9e5c" }
 dependencies = [
     { name = "dirhash", marker = "python_full_version >= '3.12' or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
     { name = "fastapi", marker = "python_full_version >= '3.12' or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
@@ -8951,7 +8951,7 @@ requires-dist = [
     { name = "func-timeout", marker = "extra == 'skyrl-train'" },
     { name = "gcsfs", marker = "extra == 'skyrl-train'" },
     { name = "griffe2md", marker = "extra == 'dev'" },
-    { name = "harbor", extras = ["daytona", "modal"], marker = "python_full_version >= '3.12' and extra == 'harbor'", git = "ssh://git@github.com/AfterQuery/harbor-aq.git?rev=2f4d85395373e6001949c38484a20130643497eb" },
+    { name = "harbor", extras = ["daytona", "modal"], marker = "python_full_version >= '3.12' and extra == 'harbor'", git = "ssh://git@github.com/AfterQuery/harbor-aq.git?rev=f2f7a15dc4f05b424a54d865850af6d9b54a9e5c" },
     { name = "hf-transfer" },
     { name = "hf-transfer", marker = "extra == 'skyrl-train'" },
     { name = "hydra-core", marker = "extra == 'skyrl-train'", specifier = "==1.3.2" },

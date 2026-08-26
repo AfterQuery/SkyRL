@@ -46,8 +46,7 @@ class HarborMCPAgent(BaseAgent):
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)
-        self.extra_env = extra_env or {}
+        super().__init__(*args, extra_env=extra_env, **kwargs)
         self.api_base = api_base or self.extra_env.get("OPENAI_BASE_URL")
         self.api_key = api_key or self.extra_env.get("OPENAI_API_KEY", "dummy")
         self.session_id = session_id
@@ -180,13 +179,12 @@ class HarborMCPAgent(BaseAgent):
             shutdown = asyncio.create_task(self._shutdown_bridge(environment))
             try:
                 await asyncio.shield(shutdown)
-            except Exception as exc:  # noqa: BLE001 - preserve cleanup errors in the trajectory
-                if trajectory is not None and not trajectory.get("error"):
-                    trajectory["stop_reason"] = "error"
-                    trajectory["error"] = (
-                        f"bridge shutdown failed: {type(exc).__name__}: {exc}"
-                    )
-                    await checkpoint(trajectory)
+            except Exception as exc:  # noqa: BLE001 - environment teardown is authoritative cleanup
+                self.logger.warning(
+                    "Bridge shutdown failed; environment teardown will clean it up: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
 
         if trajectory and trajectory.get("error"):
             raise RuntimeError(str(trajectory["error"]))

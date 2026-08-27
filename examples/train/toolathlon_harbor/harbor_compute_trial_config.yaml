@@ -1,0 +1,36 @@
+# Harbor TrialConfig for Toolathlon generation/training with task containers
+# running on AfterQuery Compute. The model and agent loop remain on the host.
+trials_dir: ~/trials/toolathlon-compute
+
+agent:
+  name: null
+  import_path: examples.train_integrations.harbor.mcp_agent:HarborMCPAgent
+  override_timeout_sec: 7200
+  mcp_servers:
+    - name: toolathlon
+      transport: stdio
+      command: python
+      args: ["-m", "t3.mcp_server"]
+  env:
+    OPENAI_API_KEY: "${TOOLATHLON_API_KEY:-dummy}"
+  kwargs:
+    max_turns: 64
+    deadline_sec: 7000
+    request_timeout_sec: 900
+    max_tokens: 8192
+    temperature: 1.0
+    collect_rollout_details: true
+    strict_rollout_details: true
+
+environment:
+  type: compute
+  force_build: false
+  delete: true
+  override_cpus: null
+  override_memory_mb: null
+  override_storage_mb: null
+  kwargs:
+    reap_after_minutes: 180
+
+verifier:
+  disable: false

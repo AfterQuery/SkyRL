@@ -2,25 +2,23 @@
 Main entrypoint for generating rollouts on Harbor tasks. For debugging purposes.
 """
 
+import asyncio
 import sys
 
 import ray
-import asyncio
-import yaml
 from loguru import logger
 
-from skyrl.train.utils import validate_cfg
-from skyrl.train.utils.utils import initialize_ray
 from skyrl.train.entrypoints.main_base import BasePPOExp
 from skyrl.train.generators.base import GeneratorInput, TrajectoryID
-from ..harbor_generator import HarborGenerator
+from skyrl.train.utils import validate_cfg
+from skyrl.train.utils.utils import initialize_ray
+
 from ..dataset import HarborTaskDataset
+from ..harbor_generator import HarborGenerator
 from .main_harbor import (
     HarborSkyRLConfig,
-    HARBOR_DEFAULT_CONFIG,
-    _deep_merge,
+    load_harbor_trial_config,
 )
-
 
 # For debugging purposes, we only generate a few samples.
 NUM_SAMPLES_TO_TEST = 10
@@ -106,10 +104,7 @@ def skyrl_entrypoint(cfg):
 def main() -> None:
     cfg = HarborSkyRLConfig.from_cli_overrides(sys.argv[1:])
 
-    # Load harbor defaults and merge CLI overrides on top
-    with open(HARBOR_DEFAULT_CONFIG) as f:
-        defaults = yaml.safe_load(f)
-    cfg.harbor_trial_config = _deep_merge(defaults, cfg.harbor_trial_config)
+    load_harbor_trial_config(cfg)
 
     validate_cfg(cfg)
     if cfg.trainer.algorithm.max_seq_len is None:

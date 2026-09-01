@@ -1,10 +1,9 @@
-# Harbor TrialConfig for SkyRL generation/training on the JSON-world
-# Toolathlon delivery. SkyRL injects task.path, agent.model_name, api_base, and
-# session_id for each trajectory.
-trials_dir: ~/trials/toolathlon
+# Harbor TrialConfig for context-managed Toolathlon GRPO rollouts on Daytona.
+# SkyRL injects task.path, agent.model_name, api_base, and session_id per trial.
+
+trials_dir: ~/toolathlon_grpo_qwen38_27b/trials
 
 agent:
-  # Clear the generic Harbor default before selecting a custom import-path agent.
   name: null
   import_path: examples.train_integrations.harbor.mcp_agent:HarborMCPAgent
   override_timeout_sec: 7200
@@ -22,20 +21,22 @@ agent:
     max_tokens: 8192
     max_context_tokens: 131072
     context_manager_factory: examples.train.toolathlon_harbor.toolathlon_context_manager:create_managed_context
-    temperature: 1.0
+    temperature: 0.7
     collect_rollout_details: true
     strict_rollout_details: true
 
 environment:
-  type: docker
+  type: daytona
   force_build: false
   delete: true
-  # Clear the defaults merged by main_harbor so task.toml remains authoritative.
   override_cpus: null
   override_memory_mb: null
   override_storage_mb: null
   kwargs:
-    auto_stop_interval_mins: null
+    # One runtime snapshot is built remotely; task files are uploaded into /opt.
+    snapshot_template_name: toolathlon-json-runtime-v1
+    auto_snapshot: false
+    auto_stop_interval_mins: 30
 
 verifier:
   disable: false

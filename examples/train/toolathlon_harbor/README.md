@@ -18,14 +18,14 @@ export TOOLATHLON_API_KEY=dummy
 export TOOLATHLON_MODEL=Qwen3-8B
 
 bash examples/train/toolathlon_harbor/run_eval.sh \
-  -i 401k-watchlist-recency-window-refresh
+  -i q3-eta-leaderboard-definition-aware-reconcile
 ```
 
 `run_eval.sh` uses Harbor's local Docker environment by default. Use the
 separate `run_compute_eval.sh` wrapper only when task containers should run on
 AfterQuery Compute.
 
-The default task root is `toolathlon-tasks/tasks`. Override it with
+The default evaluation root is `toolathlon-tasks/eval_tasks`, which contains the 100 held-out tasks listed in `toolathlon-tasks/samples/pass-at-4-100.txt`. Override it with
 `TOOLATHLON_TASKS_DIR`. The launcher builds `toolathlon-json-runtime:v1` from
 the bundled runtime archive as `linux/amd64` when the image is missing.
 Additional arguments are forwarded to `harbor run`, so omitting `-i` runs the
@@ -56,7 +56,7 @@ echo "$TOKEN" | docker login us-docker.pkg.dev \
   -u oauth2accesstoken --password-stdin
 
 bash examples/train/toolathlon_harbor/run_compute_eval.sh \
-  -i 401k-watchlist-recency-window-refresh
+  -i q3-eta-leaderboard-definition-aware-reconcile
 ```
 
 `run_compute_eval.sh` exits immediately with an explanatory error when
@@ -74,8 +74,8 @@ The reference and no-op paths do not call a model:
 
 ```bash
 cd toolathlon-tasks
-harbor run --path tasks -i 401k-watchlist-recency-window-refresh --agent oracle
-harbor run --path tasks -i 401k-watchlist-recency-window-refresh --agent nop
+harbor run --path eval_tasks -i q3-eta-leaderboard-definition-aware-reconcile --agent oracle
+harbor run --path eval_tasks -i q3-eta-leaderboard-definition-aware-reconcile --agent nop
 ```
 
 Expect rewards `1.0` and `0.0`, respectively.
@@ -87,8 +87,8 @@ Registry as above and run:
 COMPUTE_API_URL=${COMPUTE_API_URL:-https://compute-api.afterquery.com} \
 COMPUTE_IMAGE_REGISTRY=${COMPUTE_IMAGE_REGISTRY:-us-docker.pkg.dev/afterquery-compute/compute-images/} \
 uv run --extra harbor harbor run \
-  --path toolathlon-tasks/tasks \
-  -i 401k-watchlist-recency-window-refresh \
+  --path toolathlon-tasks/eval_tasks \
+  -i q3-eta-leaderboard-definition-aware-reconcile \
   --agent oracle \
   --env compute \
   --n-concurrent 1
@@ -98,6 +98,39 @@ This validates image building, the remote environment lifecycle, solution
 replay, and verification without making a model request.
 
 ## SkyRL generation and training
+
+### Shared Daytona runtime (no local Docker required)
+
+For Daytona evaluation or GRPO, build the runtime once as a named snapshot on
+Daytona itself. The build happens remotely and does not require a Docker daemon
+on the SkyRL host:
+
+```bash
+export DAYTONA_API_KEY=...
+uv run --extra harbor python \
+  examples/train/toolathlon_harbor/create_daytona_runtime_snapshot.py \
+  --archive toolathlon-tasks/runtime/toolathlon-json-runtime-src.tar.gz \
+  --name toolathlon-json-runtime-v1
+```
+
+Stage the task dataset once on storage visible to the Ray workers. Staged tasks
+contain `environment/task/` and `environment/mcp.json`, but no Dockerfile. Their
+`task.toml` selects the shared runtime image, `/opt` upload workdir, and the
+task-specific `T3_SERVERS` value:
+
+```bash
+uv run python examples/train/toolathlon_harbor/prepare_daytona_tasks.py \
+  --source toolathlon-tasks/tasks \
+  --output "$HOME/data/toolathlon-harbor/tasks" \
+  --runtime-image us-docker.pkg.dev/afterquery-compute/compute-images/toolathlon-json-runtime:v1
+```
+
+The named Daytona snapshot is the normal startup path. The registry image is a
+fallback and must be built and pushed by CI or another Docker-capable machine;
+this host does not need to build it. The two-node launcher stages the dataset
+automatically when `TOOLATHLON_TASKS_DIR` is absent. Override
+`TOOLATHLON_RUNTIME_IMAGE` or `DAYTONA_SNAPSHOT_TEMPLATE` to select another
+version.
 
 Use the existing Harbor entrypoint with this adapter's trial configuration and
 the task directory as the dataset:

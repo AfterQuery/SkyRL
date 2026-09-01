@@ -6,17 +6,15 @@ Reuses HarborExp's generator/dataset overrides and swaps in
 ``examples/train/fully_async/main_fully_async.py`` for harbor.
 """
 
-import asyncio
 import sys
 
 import ray
-import yaml
 
 from skyrl.train.fully_async_trainer import FullyAsyncRayPPOTrainer
 from skyrl.train.utils import validate_cfg
 from skyrl.train.utils.utils import initialize_ray
 
-from .main_harbor import HARBOR_DEFAULT_CONFIG, HarborExp, HarborSkyRLConfig, _deep_merge
+from .main_harbor import HarborExp, HarborSkyRLConfig, load_harbor_trial_config
 
 
 class HarborFullyAsyncExp(HarborExp):
@@ -52,9 +50,7 @@ def skyrl_entrypoint(cfg):
 def main() -> None:
     cfg = HarborSkyRLConfig.from_cli_overrides(sys.argv[1:])
 
-    with open(HARBOR_DEFAULT_CONFIG) as f:
-        defaults = yaml.safe_load(f)
-    cfg.harbor_trial_config = _deep_merge(defaults, cfg.harbor_trial_config)
+    load_harbor_trial_config(cfg)
 
     validate_cfg(cfg)
     if cfg.trainer.algorithm.max_seq_len is None:

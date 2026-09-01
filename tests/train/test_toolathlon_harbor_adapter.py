@@ -47,7 +47,7 @@ def test_compute_config_keeps_agent_on_host_and_selects_compute():
 def test_launchers_use_restored_bundle_layout_and_compute_environment():
     local_launcher = (ADAPTER / "run_eval.sh").read_text()
     compute_launcher = (ADAPTER / "run_compute_eval.sh").read_text()
-    assert "toolathlon-tasks/tasks}" in local_launcher
+    assert "toolathlon-tasks/eval_tasks}" in local_launcher
     assert "toolathlon-tasks/runtime/" in local_launcher
     assert "--platform linux/amd64 --load" in local_launcher
     assert '"$HERE/run_eval.sh" --env compute "$@"' in compute_launcher
@@ -55,15 +55,25 @@ def test_launchers_use_restored_bundle_layout_and_compute_environment():
 
 
 def test_launcher_keeps_toolathlon_out_of_generic_agent():
-    generic = (
-        (ROOT / "examples/train_integrations/harbor/mcp_agent.py").read_text().lower()
-    )
-    runner = (
-        (ROOT / "examples/train_integrations/harbor/mcp_runner.py").read_text().lower()
-    )
-    bridge = (
-        (ROOT / "examples/train_integrations/harbor/mcp_bridge.py").read_text().lower()
-    )
+    generic = (ROOT / "examples/train_integrations/harbor/mcp_agent.py").read_text().lower()
+    runner = (ROOT / "examples/train_integrations/harbor/mcp_runner.py").read_text().lower()
+    bridge = (ROOT / "examples/train_integrations/harbor/mcp_bridge.py").read_text().lower()
     assert "toolathlon" not in generic
     assert "toolathlon" not in runner
     assert "toolathlon" not in bridge
+
+
+
+def test_daytona_training_uses_shared_runtime_snapshot():
+    config = yaml.safe_load(
+        (ADAPTER / "harbor_daytona_training_config.yaml").read_text()
+    )
+    kwargs = config["environment"]["kwargs"]
+    assert kwargs["snapshot_template_name"] == "toolathlon-json-runtime-v1"
+    assert kwargs["auto_snapshot"] is False
+
+    launcher = (ADAPTER / "run_grpo_qwen38_27b_2node.sh").read_text()
+    assert "prepare_daytona_tasks.py" in launcher
+    assert "TOOLATHLON_RUNTIME_IMAGE" in launcher
+    assert "DAYTONA_SNAPSHOT_TEMPLATE" in launcher
+    assert "Dockerfile" not in launcher

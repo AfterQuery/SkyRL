@@ -5,29 +5,37 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shlex
-from pathlib import Path, PurePosixPath
+from importlib import import_module
 from typing import Any
-from uuid import uuid4
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
-from harbor.models.trial.paths import EnvironmentPaths
 
-from .mcp_runner import run_loop
+from .mcp_runner import ContextManagerFactory, run_loop
+from .remote_mcp import RemoteMCPBridge
+
+
+class ContextLengthExceededError(RuntimeError):
+    """Harbor-visible terminal context overflow with usable rollout details."""
+
+
+def _load_context_manager_factory(import_path: str | None) -> ContextManagerFactory | None:
+    if import_path is None:
+        return None
+    module_name, separator, attribute = import_path.partition(":")
+    if not separator or not module_name or not attribute:
+        raise ValueError("context_manager_factory must use module.path:attribute syntax")
+    factory = getattr(import_module(module_name), attribute)
+    if not callable(factory):
+        raise TypeError(f"context manager factory is not callable: {import_path}")
+    return factory
 
 
 class HarborMCPAgent(BaseAgent):
     """Run the model locally and dispatch configured stdio MCP tools remotely."""
 
     SUPPORTS_ATIF = False
-    _REMOTE_DIR = PurePosixPath("/opt/harbor-mcp-agent")
-    _REMOTE_BRIDGE = _REMOTE_DIR / "bridge.py"
-    _REMOTE_SOCKET = _REMOTE_DIR / "bridge.sock"
-    _REMOTE_PID = _REMOTE_DIR / "bridge.pid"
-    _REMOTE_RPC_DIR = _REMOTE_DIR / "rpc"
-    _BRIDGE_LOG = EnvironmentPaths.agent_dir / "bridge.log"
     _MAX_TRAJECTORY_BYTES = 100_000_000
 
     def __init__(
@@ -42,6 +50,16 @@ class HarborMCPAgent(BaseAgent):
         temperature: float = 0.0,
         collect_rollout_details: bool = False,
         strict_rollout_details: bool = False,
+        context_manager_factory: str | None = None,
+        max_context_tokens: int | None = None,
+        context_safety_tokens: int = 2048,
+        context_warning_ratio: float = 0.75,
+        context_compact_ratio: float = 0.85,
+        context_target_ratio: float = 0.70,
+        context_keep_recent_turns: int = 4,
+        context_keep_reasoning_turns: int = 1,
+        inline_tool_output_chars: int = 12_000,
+        max_context_resets: int = 2,
         extra_env: dict[str, str] | None = None,
         *args: Any,
         **kwargs: Any,
@@ -57,15 +75,24 @@ class HarborMCPAgent(BaseAgent):
         self.temperature = temperature
         self.collect_rollout_details = collect_rollout_details
         self.strict_rollout_details = strict_rollout_details
+        self.context_manager_factory = _load_context_manager_factory(context_manager_factory)
+        self.max_context_tokens = max_context_tokens
+        self.context_safety_tokens = context_safety_tokens
+        self.context_warning_ratio = context_warning_ratio
+        self.context_compact_ratio = context_compact_ratio
+        self.context_target_ratio = context_target_ratio
+        self.context_keep_recent_turns = context_keep_recent_turns
+        self.context_keep_reasoning_turns = context_keep_reasoning_turns
+        self.inline_tool_output_chars = inline_tool_output_chars
+        self.max_context_resets = max_context_resets
         self._bridge_tools: list[dict[str, Any]] = []
+        self._remote_bridge = RemoteMCPBridge(self.logs_dir)
         if not self.api_base:
             raise ValueError("HarborMCPAgent requires api_base or OPENAI_BASE_URL")
         if not self.model_name:
             raise ValueError("HarborMCPAgent requires agent.model_name")
         if len(self.mcp_servers) != 1 or self.mcp_servers[0].transport != "stdio":
-            raise ValueError(
-                "HarborMCPAgent currently requires exactly one stdio MCP server"
-            )
+            raise ValueError("HarborMCPAgent currently requires exactly one stdio MCP server")
         if not self.mcp_servers[0].command:
             raise ValueError("HarborMCPAgent requires an MCP server command")
 
@@ -74,76 +101,17 @@ class HarborMCPAgent(BaseAgent):
         return "harbor-mcp"
 
     def version(self) -> str | None:
-        return "2"
+        return "3"
 
     def _request_model(self) -> str:
         assert self.model_name is not None
         return self.model_name.split("/", 1)[-1]
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        local_bridge = Path(__file__).with_name("mcp_bridge.py")
-        directories = [
-            self._REMOTE_DIR.as_posix(),
-            self._REMOTE_RPC_DIR.as_posix(),
-            EnvironmentPaths.agent_dir.as_posix(),
-        ]
-        result = await environment.exec(
-            "mkdir -p " + " ".join(shlex.quote(path) for path in directories),
-            user="root",
-            timeout_sec=30,
-        )
-        if result.return_code != 0:
-            raise RuntimeError(
-                result.stderr
-                or result.stdout
-                or "failed to create MCP bridge directory"
-            )
-        await environment.upload_file(local_bridge, self._REMOTE_BRIDGE.as_posix())
+        await self._remote_bridge.setup(environment, self.mcp_servers[0])
+        self._bridge_tools = self._remote_bridge.tools
 
-        server = self.mcp_servers[0]
-        command = [
-            "python3",
-            self._REMOTE_BRIDGE.as_posix(),
-            "serve",
-            "--socket",
-            self._REMOTE_SOCKET.as_posix(),
-            "--mcp-command",
-            server.command or "",
-        ]
-        for arg in server.args:
-            command.append(f"--mcp-arg={arg}")
-        shell_command = " ".join(shlex.quote(part) for part in command)
-        start = await environment.exec(
-            f"rm -f {shlex.quote(self._REMOTE_SOCKET.as_posix())}; "
-            f"nohup {shell_command} > {shlex.quote(self._BRIDGE_LOG.as_posix())} 2>&1 "
-            f"< /dev/null & echo $! > {shlex.quote(self._REMOTE_PID.as_posix())}",
-            user="root",
-            timeout_sec=30,
-        )
-        if start.return_code != 0:
-            raise RuntimeError(
-                start.stderr or start.stdout or "failed to start MCP bridge"
-            )
-
-        last_error: Exception | None = None
-        for _ in range(30):
-            try:
-                response = await self._bridge_rpc(
-                    environment, {"op": "list_tools"}, timeout_sec=30
-                )
-                tools = response.get("tools")
-                if not isinstance(tools, list):
-                    raise TypeError("MCP bridge list_tools response omitted tools")
-                self._bridge_tools = tools
-                return
-            except Exception as exc:  # noqa: BLE001 - readiness retries include provider errors
-                last_error = exc
-                await asyncio.sleep(1)
-        raise RuntimeError(f"MCP bridge did not become ready: {last_error}")
-
-    async def run(
-        self, instruction: str, environment: BaseEnvironment, context: AgentContext
-    ) -> None:
+    async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
         trajectory: dict[str, Any] | None = None
 
         async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -174,6 +142,17 @@ class HarborMCPAgent(BaseAgent):
                 collect_rollout_details=self.collect_rollout_details,
                 strict_rollout_details=self.strict_rollout_details,
                 session_id=self.session_id,
+                context_manager_factory=self.context_manager_factory,
+                artifact_dir=self.logs_dir / "context",
+                max_context_tokens=self.max_context_tokens,
+                context_safety_tokens=self.context_safety_tokens,
+                context_warning_ratio=self.context_warning_ratio,
+                context_compact_ratio=self.context_compact_ratio,
+                context_target_ratio=self.context_target_ratio,
+                context_keep_recent_turns=self.context_keep_recent_turns,
+                context_keep_reasoning_turns=self.context_keep_reasoning_turns,
+                inline_tool_output_chars=self.inline_tool_output_chars,
+                max_context_resets=self.max_context_resets,
             )
         finally:
             shutdown = asyncio.create_task(self._shutdown_bridge(environment))
@@ -186,22 +165,13 @@ class HarborMCPAgent(BaseAgent):
                     exc,
                 )
 
+        if trajectory and trajectory.get("stop_reason") == "context_length":
+            raise ContextLengthExceededError(str(trajectory.get("error") or "context recovery exhausted"))
         if trajectory and trajectory.get("error"):
             raise RuntimeError(str(trajectory["error"]))
 
     async def _shutdown_bridge(self, environment: BaseEnvironment) -> None:
-        await self._bridge_rpc(environment, {"op": "shutdown"}, timeout_sec=30)
-        pid_file = shlex.quote(self._REMOTE_PID.as_posix())
-        wait = await environment.exec(
-            f"pid=$(cat {pid_file}); "
-            'while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done',
-            user="root",
-            timeout_sec=30,
-        )
-        if wait.return_code != 0:
-            raise RuntimeError(
-                wait.stderr or wait.stdout or "MCP bridge did not stop cleanly"
-            )
+        await self._remote_bridge.shutdown(environment)
 
     async def _bridge_rpc(
         self,
@@ -210,50 +180,7 @@ class HarborMCPAgent(BaseAgent):
         *,
         timeout_sec: int,
     ) -> dict[str, Any]:
-        rpc_id = uuid4().hex
-        local_request = self.logs_dir / f"bridge-request-{rpc_id}.json"
-        local_response = self.logs_dir / f"bridge-response-{rpc_id}.json"
-        remote_request = self._REMOTE_RPC_DIR / f"{rpc_id}.request.json"
-        remote_response = self._REMOTE_RPC_DIR / f"{rpc_id}.response.json"
-        local_request.write_text(json.dumps(request, ensure_ascii=False))
-        try:
-            await environment.upload_file(local_request, remote_request.as_posix())
-            command = " ".join(
-                shlex.quote(part)
-                for part in [
-                    "python3",
-                    self._REMOTE_BRIDGE.as_posix(),
-                    "request",
-                    "--socket",
-                    self._REMOTE_SOCKET.as_posix(),
-                    "--request-file",
-                    remote_request.as_posix(),
-                    "--response-file",
-                    remote_response.as_posix(),
-                ]
-            )
-            result = await environment.exec(
-                command, user="root", timeout_sec=timeout_sec
-            )
-            if result.return_code != 0:
-                raise RuntimeError(
-                    result.stderr or result.stdout or "MCP bridge request failed"
-                )
-            await environment.download_file(remote_response.as_posix(), local_response)
-            if local_response.stat().st_size > self._MAX_TRAJECTORY_BYTES:
-                raise RuntimeError("MCP bridge response exceeds 100 MB")
-            envelope = json.loads(local_response.read_text())
-            if envelope.get("status") != "ok":
-                raise RuntimeError(
-                    str(envelope.get("error") or "MCP bridge returned an error")
-                )
-            payload = envelope.get("result")
-            if not isinstance(payload, dict):
-                raise TypeError("MCP bridge returned an invalid result")
-            return payload
-        finally:
-            local_request.unlink(missing_ok=True)
-            local_response.unlink(missing_ok=True)
+        return await self._remote_bridge.rpc(environment, request, timeout_sec=timeout_sec)
 
     def _write_trajectory(self, trajectory: dict[str, Any]) -> None:
         local = self.logs_dir / "trajectory.json"
@@ -276,6 +203,9 @@ class HarborMCPAgent(BaseAgent):
             "agent_stop_reason": trajectory.get("stop_reason", "error"),
             "all_messages": trajectory.get("messages") or [],
             "elapsed_seconds": trajectory.get("elapsed_seconds"),
+            "context_events": trajectory.get("context_events") or [],
+            "active_messages": trajectory.get("active_messages") or [],
+            "context_artifact_dir": trajectory.get("context_artifact_dir"),
         }
         details = trajectory.get("rollout_details")
         if details:

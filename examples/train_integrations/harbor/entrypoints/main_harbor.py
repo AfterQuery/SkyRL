@@ -3,20 +3,21 @@ Main entrypoint for training on Harbor tasks.
 """
 
 import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 import ray
 import yaml
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict
 
+from skyrl.train.config import GeneratorConfig, SkyRLTrainConfig
 from skyrl.train.entrypoints.main_base import BasePPOExp
-from skyrl.train.config import SkyRLTrainConfig, GeneratorConfig, get_config_as_yaml_str
 from skyrl.train.utils import validate_cfg
-from skyrl.train.utils.utils import initialize_ray
 from skyrl.train.utils.rate_limiter import RateLimiterConfig
-from ..harbor_generator import HarborGenerator
+from skyrl.train.utils.utils import initialize_ray
+
 from ..dataset import HarborTaskDataset
+from ..harbor_generator import HarborGenerator
 
 # NOTE (sumanthrh): We use a YAML to store the defaults for the Harbor trial configuration
 # TODO: Convert to a dataclass
@@ -33,6 +34,32 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
     return base
 
 
+def _load_yaml_mapping(path: Path, description: str) -> dict:
+    """Load a YAML mapping, with a useful error for invalid trial configs."""
+    with path.open() as f:
+        value = yaml.safe_load(f)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError(f"{description} must contain a YAML mapping, got {type(value).__name__}: {path}")
+    return value
+
+
+def load_harbor_trial_config(cfg: "HarborSkyRLConfig") -> None:
+    """Merge Harbor defaults, an optional config file, and CLI overrides."""
+    if not isinstance(cfg.harbor_trial_config, dict):
+        raise TypeError(
+            "harbor_trial_config must be a mapping of CLI overrides. "
+            "Use harbor_trial_config_path=/path/to/config.yaml to load a YAML file."
+        )
+
+    merged = _load_yaml_mapping(HARBOR_DEFAULT_CONFIG, "Harbor default config")
+    if cfg.harbor_trial_config_path:
+        config_path = Path(cfg.harbor_trial_config_path).expanduser()
+        merged = _deep_merge(merged, _load_yaml_mapping(config_path, "Harbor trial config"))
+    cfg.harbor_trial_config = _deep_merge(merged, cfg.harbor_trial_config)
+
+
 @dataclass
 class HarborGeneratorConfig(GeneratorConfig):
     """GeneratorConfig with Harbor-specific rate limiting."""
@@ -45,7 +72,8 @@ class HarborGeneratorConfig(GeneratorConfig):
 class HarborSkyRLConfig(SkyRLTrainConfig):
     """SkyRLTrainConfig with Harbor trial configuration."""
 
-    harbor_trial_config: Dict[str, Any] = field(default_factory=dict)
+    harbor_trial_config: dict[str, Any] = field(default_factory=dict)
+    harbor_trial_config_path: str | None = None
     generator: HarborGeneratorConfig = field(default_factory=HarborGeneratorConfig)
 
 
@@ -100,10 +128,7 @@ def skyrl_entrypoint(cfg):
 def main() -> None:
     cfg = HarborSkyRLConfig.from_cli_overrides(sys.argv[1:])
 
-    # Load harbor defaults and merge CLI overrides on top
-    with open(HARBOR_DEFAULT_CONFIG) as f:
-        defaults = yaml.safe_load(f)
-    cfg.harbor_trial_config = _deep_merge(defaults, cfg.harbor_trial_config)
+    load_harbor_trial_config(cfg)
 
     validate_cfg(cfg)
     if cfg.trainer.algorithm.max_seq_len is None:

@@ -2,10 +2,8 @@ import asyncio
 import logging
 import os
 import time
-from pathlib import Path
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional
 from uuid import uuid4
 
 # Suppress LiteLLM verbose logging
@@ -17,7 +15,10 @@ from tqdm import tqdm
 from harbor.models.agent.rollout_detail import RolloutDetail
 from harbor.models.trial.config import TrialConfig
 from harbor.trial.trial import Trial
-from skyrl.backends.skyrl_train.inference_servers.base import ConversationType, InferenceEngineInterface
+from skyrl.backends.skyrl_train.inference_servers.base import (
+    ConversationType,
+    InferenceEngineInterface,
+)
 from skyrl.train.generators.base import (
     GeneratorInput,
     GeneratorInterface,
@@ -59,7 +60,7 @@ class HarborTrajectoryOutput:
     trajectory_id: TrajectoryID
     # Entire rollout_details list as returned by harbor's agent_result. None for failed trajectories
     # (agent_timeout / error) that we will mask in `build_step_wise_generator_output`.
-    rollout_details: Optional[List[RolloutDetail]] = None
+    rollout_details: list[RolloutDetail] | None = None
     reward: float = 0.0
     num_turns: int = 0
     # One of: "complete", "context_length", "agent_timeout", "error". Used by
@@ -67,20 +68,20 @@ class HarborTrajectoryOutput:
     stop_reason: str = "complete"
     # End-to-end wall-clock time (seconds) to generate this trajectory. Optional: left as None if
     # timing was not recorded.
-    e2e_time: Optional[float] = None
+    e2e_time: float | None = None
     # Agent-reported detail, when the agent puts it in agent_result.metadata. Optional because
     # not every agent does (terminus-2 reports only n_episodes), so metrics below are emitted
     # only for the trajectories that carry them.
-    n_tool_calls: Optional[int] = None
-    agent_stop_reason: Optional[str] = None
+    n_tool_calls: int | None = None
+    agent_stop_reason: str | None = None
     # Target-tool recall, and the raw verifier coverage before any shaping. Both kept so the
     # unshaped number stays reportable and comparable to the benchmark.
-    tool_recall: Optional[float] = None
-    raw_reward: Optional[float] = None
+    tool_recall: float | None = None
+    raw_reward: float | None = None
 
 
 def build_step_wise_generator_output(
-    trajectory_outputs: List[HarborTrajectoryOutput], overlong_filtering: bool
+    trajectory_outputs: list[HarborTrajectoryOutput], overlong_filtering: bool
 ) -> GeneratorOutput:
     """Flatten per-trajectory rollout details into one entry per LLM turn.
 
@@ -108,24 +109,24 @@ def build_step_wise_generator_output(
     masked_instance_ids = timeout_instance_ids | error_instance_ids
 
     # 2. Walk trajectories and emit one entry of GeneratorOutput per step.
-    prompt_token_ids: List[List[int]] = []
-    response_ids: List[List[int]] = []
-    rewards: List[float] = []
-    loss_masks: List[List[int]] = []
-    stop_reasons: List[str] = []
-    is_last_step_list: List[bool] = []
-    out_trajectory_ids: List[TrajectoryID] = []
-    rollout_logprobs_list: List[List[float]] = []
+    prompt_token_ids: list[list[int]] = []
+    response_ids: list[list[int]] = []
+    rewards: list[float] = []
+    loss_masks: list[list[int]] = []
+    stop_reasons: list[str] = []
+    is_last_step_list: list[bool] = []
+    out_trajectory_ids: list[TrajectoryID] = []
+    rollout_logprobs_list: list[list[float]] = []
 
-    successful_trajectories: List[HarborTrajectoryOutput] = []
-    response_ids_for_metrics: List[List[int]] = []
-    rewards_for_metrics: List[float] = []
+    successful_trajectories: list[HarborTrajectoryOutput] = []
+    response_ids_for_metrics: list[list[int]] = []
+    rewards_for_metrics: list[float] = []
     # One generation time per successful trajectory; used for completion-time metrics (avoids the
     # duplicate per-step entries below inflating the stats).
-    trajectory_generation_times_per_prompt: List[Optional[float]] = []
+    trajectory_generation_times_per_prompt: list[float | None] = []
     # One generation time per emitted step, aligned 1:1 with the flattened per-step arrays above.
     # Per trajectory we replicate its trajectory-level e2e_time across all of its steps.
-    out_trajectory_generation_times: List[Optional[float]] = []
+    out_trajectory_generation_times: list[float | None] = []
     for traj in trajectory_outputs:
         tid = traj.trajectory_id
 
@@ -146,8 +147,9 @@ def build_step_wise_generator_output(
         successful_trajectories.append(traj)
 
         # 2.3. Check rollout_details expected format.
-        # Expect no summarization; rollout_details is a single linear chat segment from the main agent.
-        # TODO(Charlie): Support summarization.
+        # One segment contains the exact prompt sampled at each step. Prompts need not be
+        # prefix extensions: a context-managed agent may compact later prompts while the
+        # already sampled completion IDs and logprobs remain immutable.
         assert len(traj.rollout_details) == 1, f"Expected exactly one rollout segment, got {len(traj.rollout_details)}."
         rollout_detail = traj.rollout_details[0]
         prompt_token_ids_per_turn = rollout_detail["prompt_token_ids"]
@@ -345,7 +347,7 @@ class HarborGenerator(GeneratorInterface):
         rate_limit_config = getattr(generator_cfg, "rate_limit", None)
         self._rate_limiter = create_rate_limiter(rate_limit_config)
 
-    def _compute_cache_salt(self) -> Optional[str]:
+    def _compute_cache_salt(self) -> str | None:
         """Derive a prefix-cache salt from the current policy version.
 
         Mirrors ``SkyRLGymGenerator._compute_cache_salt``: keyed on the engine's ``weight_version`` and
@@ -374,7 +376,7 @@ class HarborGenerator(GeneratorInterface):
         # Captured once so every trajectory shares the policy version at the start of the batch.
         cache_salt = self._compute_cache_salt()
 
-        all_outputs: List[HarborTrajectoryOutput] = [None] * len(prompts)  # type: ignore[list-item]
+        all_outputs: list[HarborTrajectoryOutput] = [None] * len(prompts)  # type: ignore[list-item]
         progress = tqdm(
             disable=disable_tqdm,  # disable for fully async training
             total=len(prompts),
@@ -403,7 +405,7 @@ class HarborGenerator(GeneratorInterface):
         self,
         prompt: ConversationType,
         trajectory_id: TrajectoryID,
-        cache_salt: Optional[str] = None,
+        cache_salt: str | None = None,
     ) -> HarborTrajectoryOutput:
         """Run a single Harbor trial and return the rollout details plus a trajectory-level reward.
         Retries on unknown errors; context length errors train with reward=0; agent timeouts mask the trajectory.
@@ -496,7 +498,7 @@ class HarborGenerator(GeneratorInterface):
                     break
                 else:
                     logger.warning(f"{prefix} failed: empty/missing rollout_details. Results: {results}")
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 # Must precede the generic handler, whose `continue` would retry and gamble
                 # another full TRIAL_RUN_TIMEOUT_S while (in sync training) the entire batch
                 # waits. wait_for has already cancelled the trial task; its container, if
@@ -509,7 +511,7 @@ class HarborGenerator(GeneratorInterface):
                     f"wedged docker exec there is the usual cause."
                 )
                 break
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - retry arbitrary Harbor/provider failures
                 logger.warning(f"{prefix} failed: Error running trial: {e}. Results: {results}")
                 continue
             finally:

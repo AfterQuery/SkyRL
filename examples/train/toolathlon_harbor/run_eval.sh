@@ -4,7 +4,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
 
-TASKS_DIR="${TOOLATHLON_TASKS_DIR:-$REPO_ROOT/toolathlon-tasks/tasks}"
+TASKS_DIR="${TOOLATHLON_TASKS_DIR:-$REPO_ROOT/toolathlon-tasks/eval_tasks}"
 RUNTIME_ARCHIVE="${TOOLATHLON_RUNTIME_ARCHIVE:-$REPO_ROOT/toolathlon-tasks/runtime/toolathlon-json-runtime-src.tar.gz}"
 RUNTIME_IMAGE="${TOOLATHLON_RUNTIME_IMAGE:-toolathlon-json-runtime:v1}"
 API_BASE="${TOOLATHLON_API_BASE:?Set TOOLATHLON_API_BASE to an OpenAI-compatible /v1 endpoint}"

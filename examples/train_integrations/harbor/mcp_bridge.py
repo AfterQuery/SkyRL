@@ -17,7 +17,7 @@ _MAX_MESSAGE_BYTES = 100_000_000
 
 def _content_json(block: Any) -> dict[str, Any]:
     if hasattr(block, "model_dump"):
-        return block.model_dump(mode="json")
+        return block.model_dump(mode="json", exclude_none=True)
     text = getattr(block, "text", None)
     return {"type": "text", "text": str(text if text is not None else block)}
 
@@ -41,9 +41,7 @@ async def serve(args: argparse.Namespace) -> None:
     ):
         await session.initialize()
 
-        async def handle(
-            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-        ) -> None:
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             is_shutdown = False
             try:
                 raw = await reader.readline()
@@ -66,8 +64,7 @@ async def serve(args: argparse.Namespace) -> None:
                                 {
                                     "name": tool.name,
                                     "description": tool.description or "",
-                                    "inputSchema": tool.inputSchema
-                                    or {"type": "object", "properties": {}},
+                                    "inputSchema": tool.inputSchema or {"type": "object", "properties": {}},
                                 }
                                 for tool in listed.tools
                             ]
@@ -77,18 +74,13 @@ async def serve(args: argparse.Namespace) -> None:
                     name = request_data.get("name")
                     arguments = request_data.get("arguments")
                     if not isinstance(name, str) or not isinstance(arguments, dict):
-                        raise ValueError(
-                            "call_tool requires string name and object arguments"
-                        )
+                        raise ValueError("call_tool requires string name and object arguments")
                     async with session_lock:
                         tool_result = await session.call_tool(name, arguments)
                     result = {
                         "status": "ok",
                         "result": {
-                            "content": [
-                                _content_json(block)
-                                for block in tool_result.content or []
-                            ],
+                            "content": [_content_json(block) for block in tool_result.content or []],
                             "is_error": bool(tool_result.isError),
                         },
                     }
@@ -110,9 +102,7 @@ async def serve(args: argparse.Namespace) -> None:
             if is_shutdown:
                 shutdown_reply_sent.set()
 
-        server = await asyncio.start_unix_server(
-            handle, path=socket_path, limit=_MAX_MESSAGE_BYTES
-        )
+        server = await asyncio.start_unix_server(handle, path=socket_path, limit=_MAX_MESSAGE_BYTES)
         await stop.wait()
         server.close()
         await server.wait_closed()
@@ -127,9 +117,7 @@ async def request(args: argparse.Namespace) -> None:
     raw = request_path.read_bytes()
     if len(raw) > _MAX_MESSAGE_BYTES:
         raise ValueError("bridge request exceeds 100 MB")
-    reader, writer = await asyncio.open_unix_connection(
-        args.socket, limit=_MAX_MESSAGE_BYTES
-    )
+    reader, writer = await asyncio.open_unix_connection(args.socket, limit=_MAX_MESSAGE_BYTES)
     writer.write(raw.rstrip(b"\n") + b"\n")
     await writer.drain()
     response = await reader.readline()

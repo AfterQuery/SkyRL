@@ -18,6 +18,8 @@ agent:
     deadline_sec: 7000
     request_timeout_sec: 900
     max_tokens: 8192
+    max_context_tokens: 131072
+    context_manager_factory: examples.train.toolathlon_harbor.toolathlon_context_manager:create_managed_context
     temperature: 1.0
     collect_rollout_details: true
     strict_rollout_details: true
